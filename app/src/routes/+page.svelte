@@ -1,11 +1,13 @@
 <script lang="ts">
   import { rpc, RpcCallError } from "$lib/rpc";
-  import type { Branch, Commit, CommitFilter, CherryPickResult, CherryPickProgress, RecentRepo, CommitDetail, CommitFile, DryRunItem, ConflictFileInfo, AppSettings } from "$lib/rpc-types";
+  import type { Branch, Commit, CommitFilter, CherryPickResult, CherryPickProgress, RecentRepo, CommitDetail, CommitFile, DryRunItem, ConflictFileInfo, AppSettings, Remote, ForgeConnection, PRSummary } from "$lib/rpc-types";
+  import { parseForge } from "$lib/forge";
   import { invoke } from "@tauri-apps/api/core";
   import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
   import { listen } from "@tauri-apps/api/event";
   import { check, type Update } from "@tauri-apps/plugin-updater";
   import { relaunch } from "@tauri-apps/plugin-process";
+  import { openUrl } from "@tauri-apps/plugin-opener";
   import Toolbar from "$lib/Toolbar.svelte";
   import CommitList from "$lib/CommitList.svelte";
   import PickQueue from "$lib/PickQueue.svelte";
@@ -16,6 +18,9 @@
   import ConflictResolver from "$lib/ConflictResolver.svelte";
   import SettingsModal from "$lib/Settings.svelte";
   import GitConsole from "$lib/GitConsole.svelte";
+  import Toast, { type ToastItem } from "$lib/Toast.svelte";
+  import ConnectForge from "$lib/ConnectForge.svelte";
+  import CreatePR from "$lib/CreatePR.svelte";
 
   // ── settings ──────────────────────────────────────────────
   const DEFAULT_SETTINGS: AppSettings = {
@@ -31,6 +36,37 @@
   let updateProgress = $state(0);
   let consoleOpen = $state(false);
   let consoleHeight = $state(180);
+
+  // ── toast notifications ───────────────────────────────────
+  let toasts = $state<ToastItem[]>([]);
+  let toastId = 0;
+
+  function showToast(type: ToastItem["type"], message: string, detail?: string) {
+    const id = ++toastId;
+    toasts = [...toasts, { id, type, message, detail }];
+    if (type !== "error") {
+      setTimeout(() => { toasts = toasts.filter(t => t.id !== id); }, type === "success" ? 5000 : 8000);
+    }
+  }
+
+  function dismissToast(id: number) {
+    toasts = toasts.filter(t => t.id !== id);
+  }
+
+  // ── undo stack ────────────────────────────────────────────
+  let undoStack = $state<Map<string, Commit>[]>([]);
+  const MAX_UNDO = 20;
+
+  function pushUndo() {
+    undoStack = [...undoStack.slice(-(MAX_UNDO - 1)), new Map(selectionMap)];
+  }
+
+  function undo() {
+    if (undoStack.length === 0) return;
+    selectionMap = new Map(undoStack[undoStack.length - 1]);
+    undoStack = undoStack.slice(0, -1);
+    scheduleDryRun();
+  }
 
   function startConsoleResize(e: MouseEvent) {
     e.preventDefault();
@@ -97,6 +133,27 @@
 
   // ── branch / commit lists ─────────────────────────────────
   let branches = $state<Branch[]>([]);
+  let remotes = $state<Remote[]>([]);
+  /** Default branch (from `origin/HEAD` or convention) — used as PR base default. */
+  let defaultBranch = $state("");
+
+  // ── M14 forge connection ─────────────────────────────────
+  let forgeConnection = $state<ForgeConnection | null>(null);
+  let connectForgeOpen = $state(false);
+  let createPrOpen = $state(false);
+  /** Snapshot of commits just applied — passed to CreatePR for title/body. */
+  let lastAppliedCommits = $state<Commit[]>([]);
+  /** Remote we pushed to — passed to CreatePR to compute project_path. */
+  let lastPushRemote = $state("");
+  /** Survives conflict resolution: what to do after all queued commits land.
+   * Set by applyPick/applyPushCreatePR. Consumed by both the success path of
+   * applyPickShas and the success path of continueCherry. */
+  let pendingFinalize = $state<{ remote: string; createPr: boolean } | null>(null);
+  /** Open PRs for the current target branch — used to show "PR #N open" status
+   * in PickQueue so the user knows if there's already a PR before they try to create one. */
+  let targetBranchPRs = $state<PRSummary[]>([]);
+  let prCheckLoading = $state(false);
+  const forgeConnected = $derived(forgeConnection !== null);
   let sourceBranch = $state("");
   let targetBranch = $state("");
   let commits = $state<Commit[]>([]);
@@ -106,19 +163,34 @@
   let selectionMap = $state(new Map<string, Commit>());
   const queue = $derived([...selectionMap.values()]);
 
+  // ── applied commits (already in target branch) ────────────
+  let appliedShas = $state(new Set<string>());
+
+  async function refreshApplied() {
+    if (!repoPath || !sourceBranch || !targetBranch || sourceBranch === targetBranch) {
+      appliedShas = new Set();
+      return;
+    }
+    try {
+      const shas = await rpc.git.cherry(repoPath, sourceBranch, targetBranch, settings.maxCommits);
+      appliedShas = new Set(shas);
+    } catch {
+      appliedShas = new Set();
+    }
+  }
+
   // ── refresh (fetch / pull) ────────────────────────────────
   let refreshing = $state(false);
 
   async function doFetch() {
     if (!repoPath) return;
     refreshing = true;
-    applyError = "";
     try {
       await rpc.git.fetch(repoPath);
-      branches = await rpc.git.branches(repoPath);
+      branches = await rpc.git.branches(repoPath, true);
       await loadCommits(sourceBranch);
     } catch (e) {
-      applyError = e instanceof RpcCallError ? e.rpcError.message : String(e);
+      showToast("error", e instanceof RpcCallError ? e.rpcError.message : String(e));
     } finally {
       refreshing = false;
     }
@@ -127,13 +199,12 @@
   async function doPull() {
     if (!repoPath) return;
     refreshing = true;
-    applyError = "";
     try {
       await rpc.git.pull(repoPath, sourceBranch);
-      branches = await rpc.git.branches(repoPath);
+      branches = await rpc.git.branches(repoPath, true);
       await loadCommits(sourceBranch);
     } catch (e) {
-      applyError = e instanceof RpcCallError ? e.rpcError.message : String(e);
+      showToast("error", e instanceof RpcCallError ? e.rpcError.message : String(e));
     } finally {
       refreshing = false;
     }
@@ -211,12 +282,13 @@
       remainingCommitFiles = new Map();
       conflictSha = "";
       applyError = "";
-      applyResult = { applied: [resolvedSha], conflicts: [] };
-      branches = await rpc.git.branches(repoPath);
+      applyResult = null;
+      branches = await rpc.git.branches(repoPath, true);
       const updated = branches.find((b) => b.isHead);
       if (updated) currentBranch = updated.name;
 
-      // Apply any remaining queued commits (may produce new conflicts)
+      // Apply any remaining queued commits (may produce new conflicts).
+      // pendingFinalize carries the push/PR intent through this recursion.
       if (remainingShas.length > 0) {
         conflictBusy = false;
         await applyPickShas(remainingShas);
@@ -224,6 +296,17 @@
       }
       // All commits applied — clear the queue selection
       selectionMap = new Map();
+      undoStack = [];
+      refreshApplied();
+      // If user originally picked "Apply & Push" or "Apply & Push & Create PR",
+      // finish that intent now. nApplied isn't precisely known here (the resolved
+      // commit just landed), so we pass 1 for messaging — accurate count survives
+      // in pickResult.applied when no conflict, but here we only know the just-resolved one.
+      if (pendingFinalize) {
+        await finalizeAfterApply(1, pendingFinalize);
+      } else {
+        showToast("success", `Conflict resolved — cherry-pick applied to ${targetBranch}`);
+      }
     } catch (e) {
       // git cherry-pick --continue failed (e.g. unstaged files, or genuine error)
       applyError = e instanceof RpcCallError ? e.rpcError.message : String(e);
@@ -294,8 +377,10 @@
     conflictSha = "";
     resolvedSet = new Set();
     applyResult = null;
-    applyError = "Cherry-pick aborted.";
+    applyError = "";
+    pendingFinalize = null; // user gave up — don't push/PR on next action
     conflictBusy = false;
+    showToast("warning", "Cherry-pick aborted.");
   }
 
   // ── commit detail (M5a) ───────────────────────────────────
@@ -366,7 +451,7 @@
         await invoke("launch_detached", { program: settings.externalDiffPath, args });
         return;
       } catch (e) {
-        applyError = `External diff tool error: ${e instanceof Error ? e.message : String(e)}`;
+        showToast("error", `External diff tool error: ${e instanceof Error ? e.message : String(e)}`);
         return;
       }
     }
@@ -468,24 +553,72 @@
     return () => { unlisten?.(); };
   });
 
+  // Auto-refresh open-PR list for the target branch whenever the inputs change.
+  // Best-effort — silently leaves the list empty on connection / API issues.
+  $effect(() => {
+    // Touch the reactive deps so Svelte tracks them
+    void forgeConnection; void repoPath; void targetBranch; void remotes;
+    refreshTargetPRs();
+  });
+
   // ── open repo ─────────────────────────────────────────────
   async function openRepo(path: string) {
     applyResult = null;
     applyError = "";
     selectionMap = new Map();
+    loadingCommits = true;
     try {
+      // Fetch everything into local vars first — no visible state changes between
+      // awaits — so the UI sees only ONE atomic transition at the end.
       const r = await rpc.git.openRepo(path);
+      const [branchList, remoteList, detectedDefault] = await Promise.all([
+        rpc.git.branches(r.path, true),
+        rpc.git.remotes(r.path).catch(() => [] as Remote[]),
+        rpc.git.defaultBranch(r.path).catch(() => ""),
+      ]);
+      const nonCurrent = branchList.find((b) => !b.isHead);
+      const newSource = nonCurrent?.name ?? r.branch;
+      const newTarget = r.branch;
+      const canCherry = newSource !== newTarget;
+      const [newCommits, appliedList] = await Promise.all([
+        rpc.git.commits(r.path, newSource, settings.maxCommits, 0, {}),
+        canCherry
+          ? rpc.git.cherry(r.path, newSource, newTarget, settings.maxCommits).catch(() => [] as string[])
+          : Promise.resolve([] as string[]),
+      ]);
+
+      // Atomic state swap — Svelte batches synchronous assignments into one render.
       repoPath = r.path;
       currentBranch = r.branch;
-      branches = await rpc.git.branches(r.path);
-      // default source = any non-current branch; target = current
-      const nonCurrent = branches.find((b) => !b.isHead);
-      sourceBranch = nonCurrent?.name ?? r.branch;
-      targetBranch = r.branch;
-      await loadCommits(sourceBranch);
+      branches = branchList;
+      remotes = remoteList;
+      defaultBranch = detectedDefault;
+      sourceBranch = newSource;
+      targetBranch = newTarget;
+      commits = newCommits;
+      appliedShas = new Set(appliedList);
+      forgeConnection = settings.forgeConnections?.[r.path] ?? null;
+      loadingCommits = false;
+
       await saveRecent(r.path);
       if (settings.autoFetchOnOpen) {
-        try { await rpc.git.fetch(r.path); branches = await rpc.git.branches(r.path); await loadCommits(sourceBranch); } catch { /* ignore */ }
+        // Background refresh after initial load — do NOT show loading state.
+        // Fetch + reload commits + cherry atomically so the user sees at most
+        // one quiet swap if remote had new commits.
+        try {
+          await rpc.git.fetch(r.path);
+          const canCherryRefresh = newSource !== newTarget;
+          const [refreshedBranches, refreshedCommits, refreshedApplied] = await Promise.all([
+            rpc.git.branches(r.path, true),
+            rpc.git.commits(r.path, newSource, settings.maxCommits, 0, {}),
+            canCherryRefresh
+              ? rpc.git.cherry(r.path, newSource, newTarget, settings.maxCommits).catch(() => [] as string[])
+              : Promise.resolve([] as string[]),
+          ]);
+          branches = refreshedBranches;
+          commits = refreshedCommits;
+          appliedShas = new Set(refreshedApplied);
+        } catch { /* ignore */ }
       }
       if (r.cherryPickHead) {
         conflictSha = r.cherryPickHead;
@@ -496,6 +629,7 @@
       }
     } catch (e) {
       applyError = e instanceof RpcCallError ? e.rpcError.message : String(e);
+      loadingCommits = false;
     }
   }
 
@@ -513,7 +647,7 @@
     }
   }
 
-  function changeSourceBranch(branch: string) {
+  async function changeSourceBranch(branch: string) {
     sourceBranch = branch;
     selectionMap = new Map();
     applyResult = null;
@@ -523,7 +657,24 @@
     commitFiles = [];
     dryRunMap = new Map();
     activeFilter = {};
-    loadCommits(branch, {});
+    // Keep old commits visible while loading; only set the loading flag so a
+    // small indicator can show. Atomic swap below avoids the bright→dim flash.
+    loadingCommits = true;
+    try {
+      const canCherry = repoPath && targetBranch && branch !== targetBranch;
+      const [newCommits, appliedList] = await Promise.all([
+        rpc.git.commits(repoPath, branch, settings.maxCommits, 0, {}),
+        canCherry
+          ? rpc.git.cherry(repoPath, branch, targetBranch, settings.maxCommits).catch(() => [] as string[])
+          : Promise.resolve([] as string[]),
+      ]);
+      commits = newCommits;
+      appliedShas = new Set(appliedList);
+    } catch (e) {
+      applyError = e instanceof RpcCallError ? e.rpcError.message : String(e);
+    } finally {
+      loadingCommits = false;
+    }
   }
 
   function applyCommitFilter(filter: CommitFilter) {
@@ -532,6 +683,7 @@
   }
 
   function toggleCommit(sha: string) {
+    pushUndo();
     const next = new Map(selectionMap);
     if (next.has(sha)) {
       next.delete(sha);
@@ -540,27 +692,35 @@
       if (c) next.set(sha, c);
     }
     selectionMap = next;
-    if (applyError) { applyError = ""; applyResult = null; }
     scheduleDryRun();
   }
 
   function removeFromQueue(sha: string) {
+    pushUndo();
     const next = new Map(selectionMap);
     next.delete(sha);
     selectionMap = next;
-    if (applyError) { applyError = ""; applyResult = null; }
+    scheduleDryRun();
+  }
+
+  function reorderQueue(from: number, to: number) {
+    pushUndo();
+    const arr = [...selectionMap.values()];
+    const [item] = arr.splice(from, 1);
+    arr.splice(to, 0, item);
+    selectionMap = new Map(arr.map(c => [c.sha, c]));
     scheduleDryRun();
   }
 
   async function createBranch(name: string, base: string) {
     if (!repoPath) return;
-    applyError = "";
     try {
       await rpc.git.createBranch(repoPath, name, base);
-      branches = await rpc.git.branches(repoPath);
+      branches = await rpc.git.branches(repoPath, true);
       targetBranch = name;
+      showToast("success", `Branch "${name}" created from "${base}"`);
     } catch (e) {
-      applyError = e instanceof RpcCallError ? e.rpcError.message : String(e);
+      showToast("error", e instanceof RpcCallError ? e.rpcError.message : String(e));
     }
   }
 
@@ -569,37 +729,86 @@
     try { await rpc.git.abort(repoPath); } catch { /* ignore */ }
     busy = false;
     progress = null;
-    applyError = "Cherry-pick cancelled.";
+    pendingFinalize = null;
+    showToast("warning", "Cherry-pick cancelled.");
+  }
+
+  /** Finalize after a successful cherry-pick batch: optionally push, optionally
+   * open the Create PR dialog, and clear `pendingFinalize`. Called both from
+   * applyPickShas success and continueCherry success so the push/PR intent
+   * survives across conflict resolution. */
+  async function finalizeAfterApply(
+    nApplied: number,
+    intent: { remote: string; createPr: boolean } | null,
+  ) {
+    if (!intent) {
+      showToast("success", `Applied ${nApplied} commit${nApplied === 1 ? "" : "s"} → ${targetBranch}`);
+      pendingFinalize = null;
+      return;
+    }
+    // Clear pendingFinalize early so any nested call (e.g. error → retry) doesn't double-execute.
+    pendingFinalize = null;
+    try {
+      await rpc.git.push(repoPath, targetBranch, intent.remote);
+      showToast("success", `Applied & pushed ${nApplied} commit${nApplied === 1 ? "" : "s"} → ${intent.remote}/${targetBranch}`);
+    } catch (pushErr) {
+      showToast("success", `Applied ${nApplied} commit${nApplied === 1 ? "" : "s"} → ${targetBranch}`);
+      showToast("error", `Push to ${intent.remote} failed: ${pushErr instanceof RpcCallError ? pushErr.rpcError.message : String(pushErr)}`);
+      // Don't open PR if push failed
+      return;
+    }
+    if (intent.createPr) {
+      createPrOpen = true;
+    }
   }
 
   // Core apply logic — called by applyPick (full queue) and continueCherry (remaining shas).
-  async function applyPickShas(shas: string[], andPush = false) {
+  async function applyPickShas(shas: string[], andPush = false, pushRemote = "origin") {
     busy = true;
     progress = null;
     applyResult = null;
     applyError = "";
     try {
-      applyResult = await rpc.git.cherryPick(
+      const pickResult = await rpc.git.cherryPick(
         repoPath, targetBranch, shas, undefined,
         (p) => { progress = p; }
       );
       // success — clear selection, refresh branches
       selectionMap = new Map();
-      branches = await rpc.git.branches(repoPath);
+      undoStack = [];
+      branches = await rpc.git.branches(repoPath, true);
       const updated = branches.find((b) => b.isHead);
       if (updated) currentBranch = updated.name;
 
-      if (andPush) {
-        await rpc.git.push(repoPath, targetBranch);
-        applyError = "";
-        (applyResult as any)._pushed = true;
+      // await refreshApplied first, then add skipped on top so they persist
+      await refreshApplied();
+      const skippedShas: string[] = pickResult.skipped ?? [];
+      if (skippedShas.length) {
+        appliedShas = new Set([...appliedShas, ...skippedShas]);
+      }
+
+      const nApplied = pickResult.applied?.length ?? shas.length;
+      if (nApplied > 0) {
+        // pendingFinalize is the source of truth for push/PR intent — andPush
+        // is kept only as a hint from the immediate caller. If the user picked
+        // "Apply & Push & Create PR" and we hit a conflict mid-way, the intent
+        // survives across continueCherry → applyPickShas recursion via this state.
+        const effective = pendingFinalize ?? (andPush ? { remote: pushRemote, createPr: false } : null);
+        await finalizeAfterApply(nApplied, effective);
+      }
+      if (skippedShas.length) {
+        const labels = skippedShas.map((sha) => {
+          const c = commits.find((x) => x.sha === sha);
+          return c ? `${c.subject} (${sha.slice(0, 7)})` : sha.slice(0, 7);
+        });
+        showToast("warning", `Skipped ${skippedShas.length} commit${skippedShas.length === 1 ? "" : "s"} — already applied`, labels.join("\n"));
       }
     } catch (e) {
       if (e instanceof RpcCallError) {
         if (e.rpcError.code === -32003) {
           const d = e.rpcError.data as { applied?: string[]; conflicts?: { sha: string; files: string[] }[] };
           const conflicts = d?.conflicts ?? [];
-          applyResult = { applied: d?.applied ?? [], conflicts };
+          applyResult = { applied: d?.applied ?? [], skipped: [], conflicts };
           if (conflicts.length > 0) {
             conflictSha = conflicts[0].sha;
             const loaded = await loadConflictFiles();
@@ -610,10 +819,10 @@
             await loadRemainingCommitFiles(conflicts[0].sha);
           }
         } else {
-          applyError = `[${e.rpcError.code}] ${e.rpcError.message}`;
+          showToast("error", `[${e.rpcError.code}] ${e.rpcError.message}`);
         }
       } else {
-        applyError = String(e);
+        showToast("error", String(e));
       }
     } finally {
       busy = false;
@@ -621,9 +830,180 @@
     }
   }
 
-  async function applyPick(andPush = false) {
+  async function applyPick(andPush = false, pushRemote = "origin") {
     if (!repoPath || queue.length === 0) return;
-    await applyPickShas(queue.map((c) => c.sha), andPush);
+    pendingFinalize = andPush ? { remote: pushRemote, createPr: false } : null;
+    await applyPickShas(queue.map((c) => c.sha), andPush, pushRemote);
+  }
+
+  // ── M13 — copy + open-in-browser handlers ─────────────────
+  async function openExternalUrl(url: string) {
+    try {
+      await openUrl(url);
+    } catch (e) {
+      showToast("error", `Could not open URL: ${String(e)}`);
+    }
+  }
+
+  function onCopyTo(label: string) {
+    showToast("success", `${label} copied`);
+  }
+
+  // ── M14 — forge connection + create PR ────────────────────
+  /** Fetch open PRs for the current target branch (best-effort).
+   * No connection / no remote / no project path → empty list. */
+  async function refreshTargetPRs() {
+    if (!forgeConnection || !repoPath || !targetBranch) {
+      targetBranchPRs = [];
+      return;
+    }
+    // Pick the first remote that resolves to a project path — usually `origin`.
+    const remoteCandidates = [...remotes];
+    remoteCandidates.sort((a, b) => (a.name === "origin" ? -1 : b.name === "origin" ? 1 : 0));
+    let projectPath = "";
+    for (const r of remoteCandidates) {
+      const p = projectPathForRemote(r.name);
+      if (p) { projectPath = p; break; }
+    }
+    if (!projectPath) {
+      targetBranchPRs = [];
+      return;
+    }
+    prCheckLoading = true;
+    try {
+      targetBranchPRs = await rpc.forge.listPRs({
+        repoPath,
+        projectPath,
+        head: targetBranch,
+      });
+    } catch {
+      // Best-effort — silently leave list empty on API errors
+      targetBranchPRs = [];
+    } finally {
+      prCheckLoading = false;
+    }
+  }
+
+  /** Refresh forgeConnection from settings (after Save in ConnectForge). */
+  async function refreshForgeConnection() {
+    if (!repoPath) return;
+    try {
+      const s = await rpc.settings.load();
+      settings = s;
+      forgeConnection = s.forgeConnections?.[repoPath] ?? null;
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** Pick the default PR base. Prefers the repo's detected default branch (from
+   * `origin/HEAD` or "main"/"master"/"develop" convention). Falls back to the
+   * first local branch that isn't the head. Never returns the head branch
+   * itself (PR head == base is invalid). */
+  function pickDefaultBase(): string {
+    const head = targetBranch;
+    if (defaultBranch && defaultBranch !== head) return defaultBranch;
+    // Try common names that aren't the head
+    for (const candidate of ["main", "master", "develop"]) {
+      if (candidate !== head && branches.some((b) => !b.remote && b.name === candidate)) {
+        return candidate;
+      }
+    }
+    // Fall back to any non-head local branch
+    const fallback = branches.find((b) => !b.remote && b.name !== head);
+    return fallback?.name ?? "";
+  }
+
+  /** Derive owner/repo (GitHub) or namespace/path (GitLab) from the remote URL.
+   * Returns empty string if the URL can't be parsed. */
+  function projectPathForRemote(remoteName: string): string {
+    const r = remotes.find((x) => x.name === remoteName);
+    if (!r) return "";
+    const info = parseForge(r.pushUrl || r.fetchUrl);
+    return info?.path ?? "";
+  }
+
+  /** Open the CreatePR dialog directly without any cherry-pick. Use case:
+   * user already has commits on the branch (pushed via terminal / another tool)
+   * and just wants to file a PR. Picks the first remote that resolves to a
+   * project path — usually `origin`. Auto-fills the title/body from the most
+   * recent commit on the target branch so the user has a sensible default. */
+  async function openCreatePrDirect() {
+    if (!forgeConnection) {
+      showToast("error", "Connect this repo to a forge first (Settings → Connected accounts).");
+      return;
+    }
+    if (!targetBranch) {
+      showToast("error", "Pick a target branch first.");
+      return;
+    }
+    // Find a remote whose URL parses to a project path
+    const candidates = [...remotes].sort((a, b) =>
+      a.name === "origin" ? -1 : b.name === "origin" ? 1 : 0
+    );
+    let chosenRemote = "";
+    for (const r of candidates) {
+      const p = projectPathForRemote(r.name);
+      if (p) { chosenRemote = r.name; break; }
+    }
+    if (!chosenRemote) {
+      showToast("error", "No remote URL maps to a forge project — check the remote points to GitHub/GitLab/Bitbucket.");
+      return;
+    }
+    lastPushRemote = chosenRemote;
+    // Best-effort: fetch the most recent commit on the target branch to seed
+    // the title/body. Empty list on any error — user can still type manually.
+    try {
+      lastAppliedCommits = await rpc.git.commits(repoPath, targetBranch, 1, 0, {});
+    } catch {
+      lastAppliedCommits = [];
+    }
+    createPrOpen = true;
+  }
+
+  /** Launched from PickQueue: "Apply & Push & Create PR" mode. */
+  async function applyPushCreatePR(remote: string) {
+    if (!repoPath || queue.length === 0) return;
+    if (!forgeConnection) {
+      showToast("error", "Connect this repo to a forge first (Settings → Connected accounts).");
+      return;
+    }
+    // Snapshot the queue BEFORE apply — applyPickShas clears selectionMap.
+    const snapshot = queue.slice();
+    lastAppliedCommits = snapshot;
+    lastPushRemote = remote;
+    // pendingFinalize survives across conflict resolution so the PR dialog
+    // opens even if cherry-pick stops mid-way for a conflict.
+    pendingFinalize = { remote, createPr: true };
+    await applyPickShas(snapshot.map((c) => c.sha), true, remote);
+  }
+
+  async function handleCreatePR(args: { base: string; head: string; title: string; body: string; draft: boolean }) {
+    if (!forgeConnection) throw new Error("No forge connection");
+    const projectPath = projectPathForRemote(lastPushRemote);
+    if (!projectPath) throw new Error(`Could not derive project path from remote "${lastPushRemote}"`);
+    const result = await rpc.forge.createPR({
+      repoPath,
+      projectPath,
+      base: args.base,
+      head: args.head,
+      title: args.title,
+      body: args.body,
+      draft: args.draft,
+    });
+    createPrOpen = false;
+    const label = forgeConnection.kind === "gitlab" ? "MR" : "PR";
+    if (result.alreadyExisted) {
+      // The server returned an existing PR/MR — surface it as a friendly toast
+      // with the URL so the user can jump straight to it.
+      showToast("warning", `${label} #${result.number} already exists for this branch`, result.url);
+    } else {
+      // Don't auto-open the browser — show toast with clickable URL.
+      showToast("success", `${label} #${result.number} created`, result.url);
+    }
+    // The PR list for this branch just changed — refresh so the PickQueue badge
+    // reflects the new state without needing to re-pick the branch.
+    refreshTargetPRs();
   }
 
   function dismissResult() {
@@ -633,7 +1013,23 @@
     conflictSha = "";
     resolvedSet = new Set();
   }
+
+  // ── global keyboard shortcuts ─────────────────────────────
+  function handleGlobalKey(e: KeyboardEvent) {
+    const target = e.target as HTMLElement;
+    if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable) return;
+    if (e.ctrlKey && e.key === "Enter" && !e.shiftKey && queue.length > 0 && !busy && repoPath) {
+      e.preventDefault();
+      applyPick(false);
+    }
+    if (e.ctrlKey && !e.shiftKey && e.key === "z") {
+      e.preventDefault();
+      undo();
+    }
+  }
 </script>
+
+<svelte:window onkeydown={handleGlobalKey} />
 
 <div class="app">
   <Toolbar {repoPath} {currentBranch} {recentRepos} {consoleOpen} onopen={openRepo} onsettings={() => (settingsOpen = true)} onconsole={() => (consoleOpen = !consoleOpen)} />
@@ -658,6 +1054,7 @@
           selectedSha={selectedCommit?.sha ?? ""}
           loading={loadingCommits}
           {refreshing}
+          applied={appliedShas}
           onsourcebranch={changeSourceBranch}
           ontoggle={toggleCommit}
           onselect={selectCommit}
@@ -671,16 +1068,25 @@
         <PickQueue
           {queue}
           {branches}
+          {remotes}
           {targetBranch}
           {sourceBranch}
           {busy}
           {progress}
           {dryRunMap}
           defaultApplyMode={settings.defaultApplyMode}
-          ontargetbranch={(b) => { targetBranch = b; applyResult = null; applyError = ""; scheduleDryRun(); }}
+          {forgeConnected}
+          targetPRs={targetBranchPRs}
+          prCheckLoading={prCheckLoading}
+          onopenpr={openExternalUrl}
+          onrefreshprs={refreshTargetPRs}
+          oncreatepr={openCreatePrDirect}
+          ontargetbranch={(b) => { targetBranch = b; applyResult = null; applyError = ""; scheduleDryRun(); refreshApplied(); }}
           onremove={removeFromQueue}
+          onreorder={reorderQueue}
           onapply={() => applyPick(false)}
-          onapplypush={() => applyPick(true)}
+          onapplypush={(remote) => applyPick(true, remote)}
+          onapplypushpr={(remote) => applyPushCreatePR(remote)}
           oncancel={cancelPick}
           oncreate={createBranch}
         />
@@ -693,7 +1099,13 @@
         {#if detailError}
           <div class="detail-error">{detailError}</div>
         {:else}
-          <CommitDetailPanel detail={commitDetail} loading={loadingDetail} />
+          <CommitDetailPanel
+            detail={commitDetail}
+            loading={loadingDetail}
+            {remotes}
+            oncopy={onCopyTo}
+            onopenurl={openExternalUrl}
+          />
           <CommitFilesPanel
             files={commitFiles}
             loading={loadingDetail}
@@ -741,12 +1153,52 @@
   {#if settingsOpen}
     <SettingsModal
       {settings}
+      forgeConnection={forgeConnection}
+      forgeConnectAvailable={!!repoPath}
       onclose={() => (settingsOpen = false)}
       onsave={saveSettings}
       onchecknow={checkForUpdates}
+      onconnectforge={() => { settingsOpen = false; connectForgeOpen = true; }}
+      ondisconnectforge={async () => {
+        if (!repoPath) return;
+        try {
+          await rpc.forge.deleteConnection(repoPath);
+          await refreshForgeConnection();
+          showToast("success", "Forge connection removed");
+        } catch (e) {
+          showToast("error", `Could not disconnect: ${String(e)}`);
+        }
+      }}
+    />
+  {/if}
+
+  {#if connectForgeOpen && repoPath}
+    <ConnectForge
+      {repoPath}
+      {remotes}
+      onclose={() => (connectForgeOpen = false)}
+      onsaved={async () => {
+        await refreshForgeConnection();
+        showToast("success", "Forge connection saved");
+      }}
+    />
+  {/if}
+
+  {#if createPrOpen && forgeConnection}
+    <CreatePR
+      forgeKind={forgeConnection.kind}
+      projectPath={projectPathForRemote(lastPushRemote)}
+      headBranch={targetBranch}
+      defaultBase={pickDefaultBase()}
+      {branches}
+      appliedCommits={lastAppliedCommits}
+      onclose={() => (createPrOpen = false)}
+      onsubmit={handleCreatePR}
     />
   {/if}
 </div>
+
+<Toast {toasts} ondismiss={dismissToast} onurlclick={openExternalUrl} />
 
 <style>
   :global(*) { box-sizing: border-box; margin: 0; padding: 0; }

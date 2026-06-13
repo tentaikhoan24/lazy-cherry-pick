@@ -127,8 +127,9 @@
               onclick={() => select(b.name)}
             >
               <span class="bs-check">{b.name === value ? "✓" : ""}</span>
-              <span class="bs-name">{b.name}</span>
+              <span class="bs-name" class:remote={b.remote}>{b.name}</span>
               {#if b.isHead}<span class="bs-head">(current)</span>{/if}
+              {#if b.remote}<span class="bs-remote">remote</span>{/if}
             </li>
           {/each}
         {/if}
@@ -231,5 +232,17 @@
   .bs-item.selected { color: var(--accent, #4a7ef5); }
   .bs-check { width: 1rem; flex-shrink: 0; font-size: 0.8rem; }
   .bs-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bs-name.remote { color: var(--text-secondary, #aaa); font-style: italic; }
   .bs-head { flex-shrink: 0; font-size: 0.72rem; color: var(--text-muted, #888); }
+  .bs-remote {
+    flex-shrink: 0;
+    font-size: 0.65rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #6da4dd;
+    border: 1px solid #6da4dd;
+    border-radius: 3px;
+    padding: 1px 5px;
+  }
 </style>

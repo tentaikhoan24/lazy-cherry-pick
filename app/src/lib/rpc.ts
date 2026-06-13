@@ -6,6 +6,7 @@ import type {
   OpenRepoResult,
   RepoStatus,
   Branch,
+  Remote,
   Commit,
   CommitFilter,
   CherryPickResult,
@@ -26,6 +27,10 @@ import type {
   AppSettings,
   ExtractDiffFilesResult,
   ExtractConflictFilesResult,
+  ForgeKind,
+  ForgeConnectionTest,
+  CreatePRResult,
+  PRSummary,
 } from "./rpc-types";
 
 export class RpcCallError extends Error {
@@ -66,6 +71,12 @@ export const rpc = {
 
     branches: (repo: string, includeRemote = false) =>
       call<Branch[]>("git.branches", { repo, includeRemote }),
+
+    remotes: (repo: string) =>
+      call<Remote[]>("git.remotes", { repo }),
+
+    defaultBranch: (repo: string, remote = "origin") =>
+      call<string>("git.defaultBranch", { repo, remote }),
 
     commits: (repo: string, ref = "HEAD", limit = 100, skip = 0, filter?: CommitFilter) =>
       call<Commit[]>("git.commits", { repo, ref, limit, skip, filter }),
@@ -141,5 +152,45 @@ export const rpc = {
 
     cleanupTmpDir: (tmpDir: string) =>
       call<Record<string, never>>("git.cleanupTmpDir", { tmpDir }),
+
+    cherry: (repo: string, source: string, target: string, maxCount = 0) =>
+      call<string[]>("git.cherry", { repo, source, target, maxCount }),
+  },
+
+  // ── M14 — Forge integration (GitHub/GitLab PR creation) ──────────────────
+  // These commands run in Rust (NOT through the sidecar) — Rust holds the
+  // token in the OS keychain and makes the HTTP request directly. The token
+  // never crosses the IPC boundary back to the frontend after save.
+  forge: {
+    testConnection: (kind: ForgeKind, baseUrl: string, token: string, username?: string) =>
+      invoke<ForgeConnectionTest>("forge_test_connection", { kind, baseUrl, token, username }),
+
+    saveConnection: (args: {
+      repoPath: string;
+      kind: ForgeKind;
+      baseUrl: string;
+      host: string;
+      username: string;
+      token: string;
+    }) => invoke<void>("forge_save_connection", args),
+
+    deleteConnection: (repoPath: string) =>
+      invoke<void>("forge_delete_connection", { repoPath }),
+
+    createPR: (args: {
+      repoPath: string;
+      projectPath: string;
+      base: string;
+      head: string;
+      title: string;
+      body: string;
+      draft: boolean;
+    }) => invoke<CreatePRResult>("forge_create_pr", args),
+
+    listPRs: (args: {
+      repoPath: string;
+      projectPath: string;
+      head: string;
+    }) => invoke<PRSummary[]>("forge_list_prs", args),
   },
 };

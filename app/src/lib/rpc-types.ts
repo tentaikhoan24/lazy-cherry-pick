@@ -23,6 +23,65 @@ export interface Branch {
   sha: string;
   isHead: boolean;
   upstream: string;
+  remote: boolean;
+}
+
+export interface Remote {
+  name: string;
+  fetchUrl: string;
+  pushUrl: string;
+}
+
+// ── M14 — Forge integration ────────────────────────────────
+export type ForgeKind = "github" | "gitlab" | "bitbucket";
+
+export interface ForgeConnection {
+  kind: ForgeKind;
+  baseURL: string;
+  host: string;
+  username: string;
+}
+
+export interface ForgeConnectionTest {
+  username: string;
+  scopes: string[];
+}
+
+export interface CreatePRArgs {
+  /** owner/repo (GitHub) or namespace/path (GitLab including subgroups). */
+  projectPath: string;
+  base: string;
+  head: string;
+  title: string;
+  body: string;
+  draft: boolean;
+}
+
+export interface CreatePRResult {
+  url: string;
+  number: number;
+  state: string;
+  /** True when the PR/MR already existed before this call (server returned it
+   * instead of creating a new one). Frontend uses this to swap the toast wording. */
+  alreadyExisted: boolean;
+}
+
+export interface PRSummary {
+  url: string;
+  number: number;
+  title: string;
+  state: string;
+  draft: boolean;
+  /** Base branch the PR will merge into. */
+  base: string;
+  /** PR author username. */
+  author: string;
+  /** ISO 8601 — last update time. */
+  updatedAt: string;
+  /** ISO 8601 — when the PR was opened. */
+  createdAt: string;
+  /** First ~200 chars of the PR description (plain). */
+  bodyPreview: string;
 }
 
 export interface CommitFilter {
@@ -50,6 +109,7 @@ export interface ConflictInfo {
 
 export interface CherryPickResult {
   applied: string[];
+  skipped: string[];
   conflicts: ConflictInfo[];
 }
 
@@ -157,6 +217,8 @@ export interface AppSettings {
   externalMergePath: string;
   externalMergeArgs: string;
   checkForUpdatesOnStartup: boolean;
+  /** Per-repo forge connection metadata. Tokens are NOT here — they live in the OS keychain. */
+  forgeConnections?: Record<string, ForgeConnection>;
 }
 
 export interface ExtractDiffFilesResult {
