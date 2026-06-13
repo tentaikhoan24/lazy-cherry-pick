@@ -106,6 +106,27 @@ func registerHandlers(s *rpc.Server) {
 		return r.Commits(ctx, p.CommitsArgs)
 	}))
 
+	s.Register("git.remotes", wrap1(func(ctx context.Context, p struct {
+		Repo string `json:"repo"`
+	}) (any, error) {
+		r, err := git.Open(ctx, p.Repo)
+		if err != nil {
+			return nil, err
+		}
+		return r.Remotes(ctx, struct{}{})
+	}))
+
+	s.Register("git.defaultBranch", wrap1(func(ctx context.Context, p struct {
+		Repo string `json:"repo"`
+		git.DefaultBranchArgs
+	}) (any, error) {
+		r, err := git.Open(ctx, p.Repo)
+		if err != nil {
+			return nil, err
+		}
+		return r.DefaultBranch(ctx, p.DefaultBranchArgs)
+	}))
+
 	// git.cherryPick uses a manual handler (not wrap1) so it can inject the
 	// progress callback that streams per-commit notifications to the frontend.
 	s.Register("git.cherryPick", func(ctx context.Context, raw json.RawMessage) (any, *rpc.Error) {
@@ -298,6 +319,18 @@ func registerHandlers(s *rpc.Server) {
 			return nil, err
 		}
 		return r.ContinueCherry(ctx, struct{}{})
+	}))
+
+	// git.cherry — detect already-applied commits (patch equivalence check)
+	s.Register("git.cherry", wrap1(func(ctx context.Context, p struct {
+		Repo string `json:"repo"`
+		git.CherryArgs
+	}) (any, error) {
+		r, err := git.Open(ctx, p.Repo)
+		if err != nil {
+			return nil, err
+		}
+		return r.Cherry(ctx, p.CherryArgs)
 	}))
 
 	// M8 — external tool support
