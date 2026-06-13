@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.9.0"
+version = "0.14.0"
 description = "Lazy Cherry Pick — batch Git cherry-pick desktop tool"
 authors = ["tentaikhoan24"]
 edition = "2021"
