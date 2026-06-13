@@ -2,6 +2,10 @@
 
 The Tauri Rust backend talks to the Go sidecar over **newline-delimited JSON-RPC 2.0** on stdin/stdout.
 
+> **Scope**: this document covers ONLY the sidecar protocol (git operations). Other IPC surfaces:
+> - **Direct Tauri commands** (Rust ↔ Frontend, not via sidecar): `settings_load`, `settings_save`, `recents_load`, `recents_save`, `sidecar_call`, `sidecar_cancel`, `launch_detached`, `launch_and_wait`, `detect_external_tools`, `git_log_read`, `git_log_clear`.
+> - **M14 forge commands** (Rust ↔ Frontend, NOT via sidecar; token handling lives in Rust only): `forge_test_connection`, `forge_save_connection`, `forge_delete_connection`, `forge_create_pr`, `forge_list_prs`. See `app/src-tauri/src/forge.rs` and `app/src/lib/rpc.ts` (`rpc.forge.*`).
+
 ## Transport
 
 - One **request** per line on the sidecar's stdin (JSON object + `\n`)
@@ -124,14 +128,51 @@ Result:
 Branch[]
 
 type Branch = {
-  name: string;
+  name: string;        // for remote branches, includes the remote prefix e.g. "origin/feature/x"
   sha: string;
   isHead: boolean;
-  upstream: string;  // empty if none
+  upstream: string;    // empty if none
+  remote: boolean;     // true for refs under refs/remotes/*
 }
 ```
 
-`includeRemote: false` (default) returns only local branches. Set to `true` to include `remotes/*`.
+`includeRemote: false` (default) returns only local branches. Set to `true` to include `remotes/*`. The frontend currently calls with `true` everywhere so the BranchSelect dropdown can search both local and remote branches after a fetch.
+
+Pseudo-refs like `refs/remotes/origin/HEAD` are filtered out — they just point at another branch and would clutter the dropdown.
+
+---
+
+### `git.remotes`
+
+Params: `{ repo: string }`
+
+Result:
+```ts
+Remote[]
+
+type Remote = {
+  name: string;      // e.g. "origin", "upstream"
+  fetchUrl: string;  // URL used for fetch
+  pushUrl: string;   // URL used for push (often identical to fetchUrl)
+}
+```
+
+Runs `git remote -v` and merges the `(fetch)` / `(push)` pair per remote into a single entry. Order matches `git remote -v` output (alphabetical, but `origin` first when present per git's own ordering on most repos). Frontend uses this to populate the "Apply & Push to <remote>" dropdown in PickQueue and to detect the forge (GitHub/GitLab/Bitbucket) for "Open in browser" buttons.
+
+---
+
+### `git.defaultBranch`
+
+Params: `{ repo: string; remote?: string }` (remote defaults to `"origin"`)
+
+Result: `string` — the repo's default branch name (e.g. `"main"`), or `""` if not detectable.
+
+Resolution order:
+1. `git symbolic-ref --short refs/remotes/<remote>/HEAD` → strips the remote prefix (so `origin/main` becomes `main`). Set by `git clone` and `git remote set-head <remote> --auto`.
+2. Conventional names: tries `main`, `master`, `develop` against `git rev-parse --verify refs/heads/<name>` and returns the first match.
+3. Empty string — caller decides the fallback.
+
+Used by the frontend as the default PR base in `CreatePR.svelte`. Loaded atomically alongside `branches`/`remotes` in `openRepo`.
 
 ---
 
@@ -191,7 +232,7 @@ Params:
 
 Result:
 ```ts
-{ applied: string[]; conflicts: ConflictInfo[] }
+{ applied: string[]; skipped: string[]; conflicts: ConflictInfo[] }
 
 type ConflictInfo = { sha: string; files: string[] }
 ```
@@ -201,11 +242,36 @@ Behavior:
 2. If `target` differs from current branch, checks out `target`
 3. Applies `shas` sequentially via `git cherry-pick`
 4. After each successful commit emits a progress notification (see Progress section above)
-5. On first conflict: **leaves the repo in conflict state** (does not abort), returns `-32003` with partial `applied` list and `conflicts`. The frontend drives resolution via `ConflictResolver` + `git.conflictFiles`/`git.resolveConflict`/`git.continueCherry`.
+5. **Empty-commit skip**: if a commit produces an empty diff (already applied / same content via another path), sidecar runs `git cherry-pick --abort` to clear `CHERRY_PICK_HEAD` and appends the SHA to `skipped` instead of failing the batch. Mirrors TortoiseGit's "Skip" prompt.
+6. On first real conflict: **leaves the repo in conflict state** (does not abort), returns `-32003` with partial `applied`/`skipped` lists and `conflicts`. The frontend drives resolution via `ConflictResolver` + `git.conflictFiles`/`git.resolveConflict`/`git.continueCherry`.
 
 Errors:
 - `-32002` `CodeDirtyTree` — uncommitted changes present
-- `-32003` `CodeCherryPickConflict` — conflict; `data.applied` and `data.conflicts` carry partial results
+- `-32003` `CodeCherryPickConflict` — conflict; `data.applied`, `data.skipped`, `data.conflicts` carry partial results
+
+---
+
+### `git.cherry`
+
+Params:
+```ts
+{
+  repo: string;
+  target: string;      // upstream / target branch
+  source: string;      // branch whose commits to check
+  maxCount?: number;   // limit comparison to <source>~maxCount; 0 = no limit
+}
+```
+
+Result: `string[]` — SHAs in `source` whose equivalent patch already exists in `target` (commits marked `-` by `git cherry`).
+
+Behavior:
+- Runs `git cherry <target> <source> [<source>~maxCount]` and parses lines prefixed `- `
+- `maxCount` limits the comparison window — frontend passes `settings.maxCommits` so the cherry comparison matches the visible commit list size (fast on large repos)
+- Fallback: if `<source>~maxCount` doesn't exist (branch shorter than `maxCount`), retries without limit
+- Returns empty slice on any error (best-effort; frontend treats as "unknown")
+
+Used by frontend to dim already-applied commits in `CommitList` and disable their checkboxes. **Limitation**: `git cherry` compares by patch-id (hash of the diff). Commits whose final state is on the target via a different patch (merge, manual conflict resolution) won't be detected — handled by the post-failure auto-skip + dim in `git.cherryPick` (see above).
 
 ---
 
