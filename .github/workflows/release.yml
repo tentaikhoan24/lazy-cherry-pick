@@ -22,6 +22,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
 
       - name: setup rust
         uses: dtolnay/rust-toolchain@stable
@@ -83,3 +84,28 @@ jobs:
         run: |
           $triple = (rustc -vV | Select-String "host:").ToString().Split(":")[1].Trim()
           gh release upload "${{ github.ref_name }}" "app/src-tauri/binaries/sidecar-$triple.exe" --clobber --repo "${{ github.repository }}"
+
+      - name: verify mcp-npm version matches tag
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart('v')
+          $pkgVersion = node -p "require('./mcp-npm/package.json').version"
+          if ($tag -ne $pkgVersion) {
+            Write-Error "mcp-npm/package.json version ($pkgVersion) does not match tag ($tag) — bump it in the same release commit."
+            exit 1
+          }
+
+      - name: inject sidecar checksum into mcp-npm/package.json
+        shell: pwsh
+        run: |
+          $triple = (rustc -vV | Select-String "host:").ToString().Split(":")[1].Trim()
+          $hash = (Get-FileHash "app/src-tauri/binaries/sidecar-$triple.exe" -Algorithm SHA256).Hash.ToLower()
+          $env:SIDECAR_SHA256 = $hash
+          node -e "const fs=require('fs');const p='mcp-npm/package.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));j.sidecarSha256=process.env.SIDECAR_SHA256;fs.writeFileSync(p, JSON.stringify(j, null, 2) + '\n');"
+
+      - name: publish npm MCP wrapper (lazy-cherry-pick-mcp)
+        shell: pwsh
+        working-directory: mcp-npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public

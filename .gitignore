@@ -48,6 +48,7 @@ sidecar/vendor/
 tmp/
 out/
 bin/
+!mcp-npm/bin/
 text.txt
 *vn.*
 *VN.*

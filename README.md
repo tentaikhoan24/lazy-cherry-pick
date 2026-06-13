@@ -146,6 +146,22 @@ The same sidecar binary doubles as a **Model Context Protocol (MCP) server**. Ru
 - Repo resolution via an explicit `repo` argument per call, or an `LCP_DEFAULT_REPO` env var for "this one repo".
 - The `initialize` response includes an `instructions` field summarizing this workflow for clients that surface it to the model.
 
+**Quickest start (Windows x64) — via npx**, no download/path needed:
+
+```json
+{
+  "mcpServers": {
+    "lazy-cherry-pick": {
+      "command": "npx",
+      "args": ["-y", "lazy-cherry-pick-mcp"],
+      "env": { "LCP_DEFAULT_REPO": "D:\\path\\to\\your\\repo" }
+    }
+  }
+}
+```
+
+Or point at a downloaded/built sidecar binary directly:
+
 ```json
 {
   "mcpServers": {

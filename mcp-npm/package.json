@@ -1,0 +1,38 @@
+{
+  "name": "lazy-cherry-pick-mcp",
+  "version": "0.15.0",
+  "sidecarSha256": "",
+  "description": "MCP server for Lazy Cherry Pick: AI tools for git status, branches, commits, diffs, cherry-pick, fetch/pull/push, and conflict resolution. Run via npx, no desktop install needed.",
+  "license": "MIT",
+  "homepage": "https://github.com/tentaikhoan24/lazy-cherry-pick",
+  "bugs": "https://github.com/tentaikhoan24/lazy-cherry-pick/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tentaikhoan24/lazy-cherry-pick.git",
+    "directory": "mcp-npm"
+  },
+  "bin": {
+    "lazy-cherry-pick-mcp": "bin/cli.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "git",
+    "cherry-pick",
+    "ai",
+    "claude",
+    "llm-tools"
+  ]
+}

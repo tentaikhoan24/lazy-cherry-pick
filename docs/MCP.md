@@ -14,8 +14,10 @@ forge (PR/MR) creation, which is deferred to M15b.
 
 - **No desktop app install needed.** The sidecar binary is fully standalone —
   `--mcp` mode has zero dependency on Tauri/Rust/the frontend.
-- **Prebuilt**: starting with the next release after this one, each
-  [GitHub Release](https://github.com/tentaikhoan24/lazy-cherry-pick/releases)
+- **Easiest: npx** (Windows x64 only today) — see [Running via npx](#running-via-npx)
+  below. No download step in your client config; `npx` fetches and caches the
+  binary on first run.
+- **Prebuilt**: each [GitHub Release](https://github.com/tentaikhoan24/lazy-cherry-pick/releases)
   attaches `sidecar-x86_64-pc-windows-msvc.exe` as a standalone download asset,
   separate from the `.msi` installer.
 - **Build it yourself**:
@@ -24,6 +26,31 @@ forge (PR/MR) creation, which is deferred to M15b.
   cd sidecar
   go build -o ..\app\src-tauri\binaries\sidecar-$triple.exe .
   ```
+
+## Running via npx
+
+The [`lazy-cherry-pick-mcp`](https://www.npmjs.com/package/lazy-cherry-pick-mcp) npm
+package is a thin launcher: on first run it downloads the matching
+`sidecar-x86_64-pc-windows-msvc.exe` from this repo's GitHub Releases, verifies its
+SHA256 against a checksum pinned in `package.json` (refusing to cache/run it on a
+mismatch), caches it under `%LOCALAPPDATA%\lazy-cherry-pick-mcp\`, and execs it with
+`--mcp`.
+
+```json
+{
+  "mcpServers": {
+    "lazy-cherry-pick": {
+      "command": "npx",
+      "args": ["-y", "lazy-cherry-pick-mcp"],
+      "env": { "LCP_DEFAULT_REPO": "D:\\path\\to\\your\\repo" }
+    }
+  }
+}
+```
+
+Windows x64 only for now — other platforms get a clear error pointing back to the
+build-from-source instructions above. Source for the wrapper lives in
+[`mcp-npm/`](../mcp-npm).
 
 ## Starting the server
 
@@ -184,6 +211,9 @@ For every tool, the repo is resolved as:
 3. Otherwise the call fails: `"no repo specified and LCP_DEFAULT_REPO is not set; pass the repo argument"`.
 
 ## Client configuration
+
+> **Prefer npx?** See [Running via npx](#running-via-npx) above — no binary path to
+> configure. The config below is for a binary you've downloaded or built yourself.
 
 ### Claude Desktop / Cursor / VS Code (generic MCP config)
 
