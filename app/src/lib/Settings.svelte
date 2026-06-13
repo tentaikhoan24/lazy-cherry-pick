@@ -1,16 +1,22 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import type { AppSettings, DetectedTool } from "./rpc-types";
+  import type { AppSettings, DetectedTool, ForgeConnection } from "./rpc-types";
 
   interface Props {
     settings: AppSettings;
     onclose: () => void;
     onsave: (s: AppSettings) => void;
     onchecknow?: () => Promise<boolean>;
+    /** M14 — current repo's forge connection, null if not configured. */
+    forgeConnection?: ForgeConnection | null;
+    /** True when a repo is open — controls availability of Connect/Disconnect. */
+    forgeConnectAvailable?: boolean;
+    onconnectforge?: () => void;
+    ondisconnectforge?: () => void;
   }
 
-  let { settings, onclose, onsave, onchecknow }: Props = $props();
+  let { settings, onclose, onsave, onchecknow, forgeConnection = null, forgeConnectAvailable = false, onconnectforge, ondisconnectforge }: Props = $props();
 
   let maxCommits = $state(settings.maxCommits);
   let defaultApplyMode = $state(settings.defaultApplyMode);
@@ -201,6 +207,35 @@
             <span class="check-ok">✓ Up to date</span>
           {:else if checkResult === "found"}
             <span class="check-found">Update found!</span>
+          {/if}
+        </div>
+      </div>
+
+      <!-- M14 — Connected accounts -->
+      <div class="section-sep">Connected accounts</div>
+
+      <div class="row">
+        <label class="label">Forge (for PR creation)</label>
+        <div class="forge-info">
+          {#if !forgeConnectAvailable}
+            <span class="hint">Open a repo to configure a forge connection.</span>
+          {:else if forgeConnection}
+            <span class="connected-label">
+              <strong>{forgeConnection.kind === "github" ? "GitHub" : forgeConnection.kind === "gitlab" ? "GitLab" : "Bitbucket"}</strong>
+              · {forgeConnection.host}
+              · <span class="mono">{forgeConnection.username}</span>
+            </span>
+            <button class="forge-action danger" onclick={() => ondisconnectforge?.()}>
+              Disconnect
+            </button>
+            <button class="forge-action" onclick={() => onconnectforge?.()}>
+              Reconnect
+            </button>
+          {:else}
+            <span class="hint">No connection for this repo.</span>
+            <button class="forge-action primary" onclick={() => onconnectforge?.()}>
+              Connect…
+            </button>
           {/if}
         </div>
       </div>
@@ -466,6 +501,45 @@
     border-top: 1px solid var(--border, #3a3a3a);
     margin-top: 0.25rem;
   }
+  .forge-info {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+  .connected-label {
+    flex: 1;
+    font-size: 0.85rem;
+    color: var(--text-secondary, #ccc);
+  }
+  .connected-label .mono {
+    font-family: ui-monospace, monospace;
+    color: var(--text, #f0f0f0);
+  }
+  .hint {
+    flex: 1;
+    font-size: 0.82rem;
+    color: var(--text-muted, #888);
+  }
+  .forge-action {
+    padding: 0.3rem 0.7rem;
+    border-radius: 4px;
+    border: 1px solid var(--border, #555);
+    background: var(--input-bg, #2a2a2a);
+    color: var(--text, #f0f0f0);
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+  .forge-action:hover { background: var(--hover, #3a3a3a); }
+  .forge-action.primary {
+    background: var(--accent, #4a7ef5);
+    border-color: var(--accent, #4a7ef5);
+    color: white;
+    font-weight: 600;
+  }
+  .forge-action.primary:hover { filter: brightness(1.1); }
+  .forge-action.danger { color: #ff8888; border-color: #6a3030; }
+  .forge-action.danger:hover { background: rgba(224, 85, 85, 0.12); }
 
   /* ── auto-detect ── */
   .detect-row {

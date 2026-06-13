@@ -51,6 +51,7 @@ type CommitFilter struct {
 
 type CherryPickResult struct {
 	Applied   []string       `json:"applied"`
+	Skipped   []string       `json:"skipped"`
 	Conflicts []ConflictInfo `json:"conflicts"`
 }
 

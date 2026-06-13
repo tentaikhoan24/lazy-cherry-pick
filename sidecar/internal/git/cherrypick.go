@@ -26,15 +26,18 @@ func (r *Repo) CherryPick(ctx context.Context, args CherryPickArgs) (*CherryPick
 	if err != nil {
 		return nil, err
 	}
-	if detached {
-		return nil, &Error{
-			Code:    CodeGitCommandFailed,
-			Message: "cannot cherry-pick onto detached HEAD; switch to a branch first",
-		}
-	}
 
+	// Resolve final target. If caller provided one, use it — even when HEAD is
+	// detached the checkout below will fix the detached state. We only fail when
+	// detached AND no target was given (nowhere to switch to).
 	target := args.Target
 	if target == "" {
+		if detached {
+			return nil, &Error{
+				Code:    CodeGitCommandFailed,
+				Message: "cannot cherry-pick onto detached HEAD; pick a target branch in the dropdown",
+			}
+		}
 		target = current
 	}
 
@@ -64,6 +67,7 @@ func (r *Repo) CherryPick(ctx context.Context, args CherryPickArgs) (*CherryPick
 
 	result := &CherryPickResult{
 		Applied:   []string{},
+		Skipped:   []string{},
 		Conflicts: []ConflictInfo{},
 	}
 
@@ -85,6 +89,12 @@ func (r *Repo) CherryPick(ctx context.Context, args CherryPickArgs) (*CherryPick
 				for _, f := range cfr.Files {
 					files = append(files, f.Path)
 				}
+			}
+			if len(files) == 0 {
+				// Commit is already applied or produces an empty diff — skip it and continue.
+				run(ctx, r.Path, "cherry-pick", "--abort") //nolint:errcheck
+				result.Skipped = append(result.Skipped, sha)
+				continue
 			}
 			result.Conflicts = append(result.Conflicts, ConflictInfo{Sha: sha, Files: files})
 			// Leave repo in conflict state — frontend drives resolution via ConflictResolver.

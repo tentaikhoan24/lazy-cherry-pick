@@ -10,6 +10,7 @@
     selectedSha: string;
     loading: boolean;
     refreshing: boolean;
+    applied: Set<string>;
     onsourcebranch: (branch: string) => void;
     ontoggle: (sha: string) => void;
     onselect: (commit: Commit) => void;
@@ -18,7 +19,7 @@
     onfilter: (filter: CommitFilter) => void;
   }
 
-  let { branches, sourceBranch, commits, selected, selectedSha, loading, refreshing, onsourcebranch, ontoggle, onselect, onfetch, onpull, onfilter }: Props = $props();
+  let { branches, sourceBranch, commits, selected, selectedSha, loading, refreshing, applied, onsourcebranch, ontoggle, onselect, onfetch, onpull, onfilter }: Props = $props();
 
   let refreshDropdownOpen = $state(false);
   let refreshMode = $state<"fetch" | "pull">("fetch");
@@ -188,6 +189,9 @@
   function stripBadgePrefix(subject: string): string {
     return subject.replace(JIRA_RE, "").replace(CC_RE, "").trimStart();
   }
+
+  // ── keyboard navigation ────────────────────────────────────
+  let rowEls: (HTMLElement | undefined)[] = [];
 </script>
 
 <svelte:window onclick={onClickOutside} />
@@ -343,32 +347,41 @@
     </div>
   {/if}
 
-  <div class="commit-list">
-    {#if loading}
+  <div class="commit-list" class:is-loading={loading}>
+    {#if loading && commits.length === 0}
       <div class="empty">Loading commits…</div>
     {:else if commits.length === 0}
       <div class="empty">No commits found.</div>
     {:else}
-      {#each commits as c}
+      {#each commits as c, i}
         {@const badge = getBadge(c.subject)}
+        {@const isApplied = applied.has(c.sha)}
         <div
           class="commit-row"
           class:checked={selected.has(c.sha)}
           class:active={selectedSha === c.sha}
+          class:applied={isApplied}
           role="row"
           tabindex="0"
+          bind:this={rowEls[i]}
           onclick={() => onselect(c)}
-          onkeydown={(e) => e.key === "Enter" && onselect(c)}
+          onkeydown={(e) => {
+            if (e.key === 'ArrowDown') { e.preventDefault(); rowEls[i + 1]?.focus(); }
+            else if (e.key === 'ArrowUp') { e.preventDefault(); i > 0 && rowEls[i - 1]?.focus(); }
+            else if (e.key === ' ' && !isApplied) { e.preventDefault(); ontoggle(c.sha); }
+            else if (e.key === 'Enter') { onselect(c); }
+          }}
         >
           <label
             class="cb-wrap"
             onclick={(e) => { e.stopPropagation(); }}
-            title={selected.has(c.sha) ? "Remove from queue" : "Add to queue"}
+            title={isApplied ? "Already applied to target branch" : (selected.has(c.sha) ? "Remove from queue" : "Add to queue")}
           >
             <input
               type="checkbox"
               checked={selected.has(c.sha)}
               onchange={() => ontoggle(c.sha)}
+              disabled={isApplied}
             />
           </label>
           <div class="commit-info">
@@ -381,6 +394,9 @@
               <span class="date">{fmt(c.time)}</span>
             </span>
           </div>
+          {#if isApplied}
+            <span class="applied-badge">Applied</span>
+          {/if}
         </div>
       {/each}
     {/if}
@@ -719,7 +735,9 @@
     flex: 1;
     overflow-y: auto;
     padding: 0.25rem 0;
+    transition: opacity 0.12s ease;
   }
+  .commit-list.is-loading { opacity: 0.5; pointer-events: none; }
   .empty {
     padding: 1.5rem;
     text-align: center;
@@ -738,6 +756,21 @@
   .commit-row:hover { background: var(--hover, #2e2e2e); }
   .commit-row.checked { background: var(--selected, #1a2a4a); }
   .commit-row.active { outline: 1px solid var(--accent, #4a7ef5); outline-offset: -1px; }
+  .commit-row:focus-visible { outline: 2px solid var(--accent, #4a7ef5); outline-offset: -2px; }
+  .commit-row.applied { opacity: 0.55; }
+  .commit-row.applied .cb-wrap { pointer-events: none; cursor: default; }
+  .applied-badge {
+    flex-shrink: 0;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: #e05555;
+    border: 1px solid #e05555;
+    border-radius: 3px;
+    padding: 1px 5px;
+    margin-right: 6px;
+    white-space: nowrap;
+  }
   .cb-wrap {
     display: flex;
     align-items: center;

@@ -1,3 +1,5 @@
+mod forge;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -254,6 +256,24 @@ struct AppSettings {
     external_merge_args: String,
     #[serde(rename = "checkForUpdatesOnStartup", default = "default_true")]
     check_for_updates_on_startup: bool,
+    /// M14 — per-repo forge connections, keyed by repo path.
+    /// Token itself is NOT here — it lives in the OS keychain. Only metadata
+    /// (kind + baseURL + username + host) so we can locate the token.
+    #[serde(rename = "forgeConnections", default)]
+    forge_connections: HashMap<String, ForgeConnection>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ForgeConnection {
+    /// "github" | "gitlab"
+    kind: String,
+    /// API base URL — e.g. "https://api.github.com" or "https://gitlab.example.com"
+    #[serde(rename = "baseURL")]
+    base_url: String,
+    /// Used to derive the keychain key together with kind + username.
+    host: String,
+    /// Display name + keychain key component.
+    username: String,
 }
 
 fn default_theme() -> String { "dark".to_string() }
@@ -273,6 +293,7 @@ impl Default for AppSettings {
             external_merge_path: String::new(),
             external_merge_args: String::new(),
             check_for_updates_on_startup: true,
+            forge_connections: HashMap::new(),
         }
     }
 }
@@ -398,6 +419,154 @@ fn recents_save(app: tauri::AppHandle, recents: Vec<RecentRepo>) -> Result<(), S
     Ok(())
 }
 
+// ── M14 forge commands ────────────────────────────────────────────────────────
+//
+// Tokens flow Frontend → Rust (input) → keychain (storage) → Rust (load on use).
+// They MUST NOT be returned to the frontend after save, and MUST NOT be passed
+// through to the sidecar — Rust is the only layer that touches plaintext tokens.
+
+fn parse_forge_kind(kind: &str) -> Result<forge::ForgeKind, String> {
+    match kind {
+        "github" => Ok(forge::ForgeKind::Github),
+        "gitlab" => Ok(forge::ForgeKind::Gitlab),
+        "bitbucket" => Ok(forge::ForgeKind::Bitbucket),
+        other => Err(format!("unsupported forge kind: {other}")),
+    }
+}
+
+#[tauri::command]
+// `username` param is required for Bitbucket (Basic Auth needs username+token);
+// ignored by GitHub/GitLab providers.
+async fn forge_test_connection(
+    kind: String,
+    base_url: String,
+    token: String,
+    username: Option<String>,
+) -> Result<forge::ConnectionTestResult, String> {
+    let k = parse_forge_kind(&kind)?;
+    let provider = forge::provider_for(&k, &base_url, username.as_deref().unwrap_or(""));
+    provider.test_connection(&token).await
+}
+
+#[tauri::command]
+fn forge_save_connection(
+    app: tauri::AppHandle,
+    repo_path: String,
+    kind: String,
+    base_url: String,
+    host: String,
+    username: String,
+    token: String,
+) -> Result<(), String> {
+    let k = parse_forge_kind(&kind)?;
+    // Save token first; if it fails, don't pollute settings.json
+    forge::token_save(&k, &host, &username, &token)?;
+    // Verify the token is actually retrievable — catches platform-specific
+    // keychain bugs where set succeeds but get fails (rare, but seen).
+    match forge::token_load(&k, &host, &username) {
+        Ok(retrieved) if retrieved == token => {}
+        Ok(_) => {
+            return Err(format!(
+                "keychain saved a different value than what we wrote (key '{}:{}:{}'); refuse to proceed",
+                kind, host, username
+            ));
+        }
+        Err(e) => {
+            return Err(format!(
+                "keychain accepted set but get failed for key '{}:{}:{}' ({e}); aborting save",
+                kind, host, username
+            ));
+        }
+    }
+    // Then update settings.json with metadata
+    let mut settings = settings_load(app.clone())?;
+    settings.forge_connections.insert(
+        repo_path,
+        ForgeConnection { kind, base_url, host, username },
+    );
+    settings_save(app, settings)
+}
+
+#[tauri::command]
+fn forge_delete_connection(
+    app: tauri::AppHandle,
+    repo_path: String,
+) -> Result<(), String> {
+    let mut settings = settings_load(app.clone())?;
+    let Some(conn) = settings.forge_connections.remove(&repo_path) else {
+        return Ok(()); // Already absent — idempotent.
+    };
+    // Only delete the keychain entry if NO other repo still references the
+    // same (kind, host, username) triple. Multiple repos can share one token
+    // (vd. all your personal GitHub repos under one PAT) — deleting the
+    // keychain entry would silently break the others.
+    let token_still_referenced = settings.forge_connections.values().any(|other| {
+        other.kind == conn.kind && other.host == conn.host && other.username == conn.username
+    });
+    if !token_still_referenced {
+        let k = parse_forge_kind(&conn.kind)?;
+        // Idempotent — ignore "not found"
+        let _ = forge::token_delete(&k, &conn.host, &conn.username);
+    }
+    settings_save(app, settings)
+}
+
+#[tauri::command]
+async fn forge_list_prs(
+    app: tauri::AppHandle,
+    repo_path: String,
+    project_path: String,
+    head: String,
+) -> Result<Vec<forge::PrSummary>, String> {
+    let settings = settings_load(app)?;
+    let conn = settings
+        .forge_connections
+        .get(&repo_path)
+        .ok_or_else(|| "no forge connection configured for this repo".to_string())?;
+    let kind = parse_forge_kind(&conn.kind)?;
+    let token = forge::token_load(&kind, &conn.host, &conn.username)
+        .map_err(|e| format!(
+            "token not found in keychain for key '{}:{}:{}' ({e}) — please reconnect",
+            conn.kind, conn.host, conn.username
+        ))?;
+    let provider = forge::provider_for(&kind, &conn.base_url, &conn.username);
+    provider.list_prs_for_branch(&token, &project_path, &head).await
+}
+
+#[tauri::command]
+async fn forge_create_pr(
+    app: tauri::AppHandle,
+    repo_path: String,
+    project_path: String,
+    base: String,
+    head: String,
+    title: String,
+    body: String,
+    draft: bool,
+) -> Result<forge::CreatePrResult, String> {
+    let settings = settings_load(app)?;
+    let conn = settings
+        .forge_connections
+        .get(&repo_path)
+        .ok_or_else(|| "no forge connection configured for this repo".to_string())?;
+    let kind = parse_forge_kind(&conn.kind)?;
+    let token = forge::token_load(&kind, &conn.host, &conn.username)
+        .map_err(|e| format!(
+            "token not found in keychain for key '{}:{}:{}' ({e}) — please reconnect",
+            conn.kind, conn.host, conn.username
+        ))?;
+    let provider = forge::provider_for(&kind, &conn.base_url, &conn.username);
+    let args = forge::CreatePrArgs {
+        project_path,
+        base,
+        head,
+        title,
+        body,
+        draft,
+    };
+    provider.create_pr(&token, &args).await
+}
+
 // ── entry point ───────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -421,6 +590,11 @@ pub fn run() {
             launch_detached,
             launch_and_wait,
             detect_external_tools,
+            forge_test_connection,
+            forge_save_connection,
+            forge_delete_connection,
+            forge_create_pr,
+            forge_list_prs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

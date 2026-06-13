@@ -75,9 +75,16 @@ type ContinueCherryResult struct {
 
 // ContinueCherry runs `git cherry-pick --continue --no-edit` to resume after
 // conflicts are resolved. --no-edit skips the editor prompt entirely.
+// If the resolved commit turns out to be empty (e.g. the conflict was resolved
+// by accepting the target side), we skip it with --skip instead of failing.
 func (r *Repo) ContinueCherry(ctx context.Context, _ struct{}) (*ContinueCherryResult, error) {
 	_, err := run(ctx, r.Path, "cherry-pick", "--continue", "--no-edit")
 	if err != nil {
+		if e, ok := err.(*Error); ok && (strings.Contains(e.Message, "now empty") || strings.Contains(e.Message, "cherry-pick --skip")) {
+			if _, skipErr := run(ctx, r.Path, "cherry-pick", "--skip"); skipErr == nil {
+				return &ContinueCherryResult{Done: true}, nil
+			}
+		}
 		return nil, err
 	}
 	return &ContinueCherryResult{Done: true}, nil
