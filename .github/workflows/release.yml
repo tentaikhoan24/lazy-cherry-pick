@@ -70,5 +70,16 @@ jobs:
             1. Download the `.msi` installer below.
             2. Run it (click "More info → Run anyway" if Windows SmartScreen warns you — the app is unsigned).
             3. **Prerequisite:** [Git for Windows](https://git-scm.com/downloads) must be installed.
+
+            ## MCP server (AI tools, no install needed)
+            Download `sidecar-x86_64-pc-windows-msvc.exe` below and run it with `--mcp` to use it as a standalone MCP server (Claude Desktop, Cursor, etc.) — the desktop app is not required. See [docs/MCP.md](https://github.com/${{ github.repository }}/blob/master/docs/MCP.md).
           releaseDraft: true
           prerelease: false
+
+      - name: upload standalone sidecar binary (MCP server)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $triple = (rustc -vV | Select-String "host:").ToString().Split(":")[1].Trim()
+          gh release upload "${{ github.ref_name }}" "app/src-tauri/binaries/sidecar-$triple.exe" --clobber --repo "${{ github.repository }}"

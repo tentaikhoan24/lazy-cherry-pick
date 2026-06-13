@@ -5,6 +5,7 @@ The Tauri Rust backend talks to the Go sidecar over **newline-delimited JSON-RPC
 > **Scope**: this document covers ONLY the sidecar protocol (git operations). Other IPC surfaces:
 > - **Direct Tauri commands** (Rust ↔ Frontend, not via sidecar): `settings_load`, `settings_save`, `recents_load`, `recents_save`, `sidecar_call`, `sidecar_cancel`, `launch_detached`, `launch_and_wait`, `detect_external_tools`, `git_log_read`, `git_log_clear`.
 > - **M14 forge commands** (Rust ↔ Frontend, NOT via sidecar; token handling lives in Rust only): `forge_test_connection`, `forge_save_connection`, `forge_delete_connection`, `forge_create_pr`, `forge_list_prs`. See `app/src-tauri/src/forge.rs` and `app/src/lib/rpc.ts` (`rpc.forge.*`).
+> - **M15a MCP server** (`sidecar.exe --mcp`, AI clients ↔ sidecar, a completely separate mode from the protocol below): see [MCP.md](MCP.md).
 
 ## Transport
 

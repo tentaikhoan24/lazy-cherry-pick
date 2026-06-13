@@ -64,7 +64,13 @@ func (r *Repo) Commits(ctx context.Context, args CommitsArgs) ([]Commit, error) 
 		return nil, err
 	}
 
-	records := strings.Split(string(out), "\x1e")
+	return parseCommits(string(out)), nil
+}
+
+// parseCommits decodes the NUL/RS-delimited output of a `git log` invocation
+// using commitFormat. Shared by Commits() and CompareBranches().
+func parseCommits(out string) []Commit {
+	records := strings.Split(out, "\x1e")
 	commits := make([]Commit, 0, len(records))
 	for _, raw := range records {
 		raw = strings.TrimLeft(raw, "\n")
@@ -96,7 +102,7 @@ func (r *Repo) Commits(ctx context.Context, args CommitsArgs) ([]Commit, error) 
 		}
 		commits = append(commits, c)
 	}
-	return commits, nil
+	return commits
 }
 
 func isEmptyRepoErr(err error) bool {

@@ -24,12 +24,26 @@ import (
 	"strings"
 
 	"github.com/lazy-cherry-pick/sidecar/internal/git"
+	"github.com/lazy-cherry-pick/sidecar/internal/mcp"
 	"github.com/lazy-cherry-pick/sidecar/internal/rpc"
 )
 
 const sidecarVersion = "0.2.0"
 
 func main() {
+	// MCP server mode — started by an AI client (Claude Desktop / Cursor / VS
+	// Code) with `--mcp`. This is a completely separate code path from the
+	// NDJSON RPC mode the Tauri app uses; the app never passes this flag, so
+	// existing behaviour is unaffected. See internal/mcp.
+	if len(os.Args) > 1 && os.Args[1] == "--mcp" {
+		defaultRepo := os.Getenv("LCP_DEFAULT_REPO")
+		srv := mcp.NewServer(defaultRepo)
+		if err := srv.Serve(context.Background(), os.Stdin, os.Stdout, os.Stderr); err != nil {
+			os.Exit(1)
+		}
+		return
+	}
+
 	srv := rpc.NewServer()
 	registerHandlers(srv)
 	if err := srv.Serve(context.Background(), os.Stdin, os.Stdout, os.Stderr); err != nil {

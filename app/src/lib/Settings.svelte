@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { getVersion } from "@tauri-apps/api/app";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
   import type { AppSettings, DetectedTool, ForgeConnection } from "./rpc-types";
 
@@ -32,6 +33,12 @@
   let externalMergeEnabled = $state(settings.externalMergeEnabled);
   let externalMergePath = $state(settings.externalMergePath);
   let externalMergeArgs = $state(settings.externalMergeArgs);
+
+  // App version — pulled from tauri.conf.json at runtime via Tauri API.
+  // Async (waits for IPC). Empty string until resolved, so the badge area
+  // can render its layout immediately and fill in the version when ready.
+  let appVersion = $state("");
+  getVersion().then((v) => { appVersion = v; }).catch(() => {});
 
   let detectedTools = $state<DetectedTool[]>([]);
   let detecting = $state(false);
@@ -377,6 +384,9 @@
     </div>
 
     <div class="modal-footer">
+      <span class="version-badge" title="Installed version">
+        Lazy Cherry Pick {appVersion ? `v${appVersion}` : ""}
+      </span>
       <button class="cancel-btn" onclick={onclose}>Cancel</button>
       <button class="save-btn" onclick={save}>Save</button>
     </div>
@@ -718,10 +728,18 @@
   .modal-footer {
     display: flex;
     justify-content: flex-end;
+    align-items: center;
     gap: 0.5rem;
     padding: 0.65rem 1rem;
     border-top: 1px solid var(--border, #3a3a3a);
     flex-shrink: 0;
+  }
+  .version-badge {
+    flex: 1;
+    font-size: 0.72rem;
+    color: var(--text-muted, #888);
+    font-family: ui-monospace, monospace;
+    user-select: text;
   }
   .cancel-btn {
     padding: 0.35rem 0.9rem;
