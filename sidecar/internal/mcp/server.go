@@ -26,7 +26,7 @@ import (
 // `initialize`; we echo a compatible one back.
 const protocolVersion = "2024-11-05"
 const serverName = "lazy-cherry-pick"
-const serverVersion = "0.15.0"
+const serverVersion = "0.16.0"
 
 // serverInstructions is returned in the `initialize` response as a hint to
 // the model: an overview of the workflow and the conflict-resolution loop, so
