@@ -217,6 +217,8 @@ export interface AppSettings {
   externalMergePath: string;
   externalMergeArgs: string;
   checkForUpdatesOnStartup: boolean;
+  /** M11a — auto-stash uncommitted changes before a cherry-pick batch, pop after. */
+  autoStash: boolean;
   /** M16/M16b — AI conflict resolution via a headless AI CLI agent. */
   aiEnabled: boolean;
   /** Preset id the UI last applied: "claude" | "gemini" | "codex" | "aider" | "custom". */

@@ -6,9 +6,31 @@
     loading: boolean;
     selectedPath: string;
     onselect: (file: CommitFile) => void;
+    // ── M11c — partial-file pick ──────────────────────────────
+    /** Target branch the partial pick lands on (for the button label). */
+    target?: string;
+    /** True while a partial pick is in flight. */
+    picking?: boolean;
+    /** Apply only the given files of this commit onto the target. */
+    onpartialpick?: (keep: string[]) => void;
   }
 
-  let { files, loading, selectedPath, onselect }: Props = $props();
+  let { files, loading, selectedPath, onselect, target = "", picking = false, onpartialpick }: Props = $props();
+
+  // M11c — which files are ticked for a partial pick.
+  let checked = $state(new Set<string>());
+  // Reset the selection whenever the file list changes (new commit selected).
+  $effect(() => { files; checked = new Set(); });
+
+  function toggleCheck(path: string) {
+    const next = new Set(checked);
+    if (next.has(path)) next.delete(path); else next.add(path);
+    checked = next;
+  }
+  const allChecked = $derived(files.length > 0 && checked.size === files.length);
+  function toggleAll() {
+    checked = allChecked ? new Set() : new Set(files.map((f) => f.path));
+  }
 
   const statusColor: Record<string, string> = {
     A: "#66bb6a",
@@ -52,10 +74,13 @@
           class:active={selectedPath === f.path}
           role="row"
           tabindex="0"
-          onclick={() => onselect(f)}
+          onclick={(e) => { if (!(e.target as HTMLElement).closest(".cb-wrap")) onselect(f); }}
           onkeydown={(e) => e.key === "Enter" && onselect(f)}
           title="Click to view diff"
         >
+          <label class="cb-wrap" title="Select for partial pick">
+            <input type="checkbox" checked={checked.has(f.path)} tabindex="-1" onchange={() => toggleCheck(f.path)} />
+          </label>
           <span class="status-badge" style="color: {statusColor[f.status] ?? '#aaa'}">{statusLabel(f.status)}</span>
           <span class="file-path">{f.path}</span>
           <span class="stats">
@@ -65,6 +90,22 @@
         </div>
       {/each}
     </div>
+    {#if onpartialpick && files.length > 0}
+      <div class="partial-footer">
+        <label class="select-all" title="Select all files">
+          <input type="checkbox" checked={allChecked} onchange={toggleAll} />
+          {checked.size > 0 ? `${checked.size} selected` : "Select files"}
+        </label>
+        <button
+          class="partial-btn"
+          disabled={checked.size === 0 || picking || checked.size === files.length}
+          title={checked.size === files.length ? "All files selected — use the normal Apply instead" : `Apply only the ${checked.size} selected file(s) onto ${target}`}
+          onclick={() => onpartialpick?.([...checked])}
+        >
+          {picking ? "Picking…" : `Pick ${checked.size || ""} file${checked.size === 1 ? "" : "s"} → ${target}`}
+        </button>
+      </div>
+    {/if}
   {/if}
 </div>
 
@@ -144,4 +185,44 @@
   }
   .added { color: #66bb6a; }
   .removed { color: #ef5350; }
+
+  /* M11c — partial-file pick */
+  .cb-wrap {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    padding: 0.1rem;
+    cursor: pointer;
+  }
+  .cb-wrap input { cursor: pointer; margin: 0; }
+  .partial-footer {
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.75rem;
+    border-top: 1px solid var(--border, #3a3a3a);
+  }
+  .select-all {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.74rem;
+    color: var(--text-secondary, #aaa);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .partial-btn {
+    margin-left: auto;
+    padding: 0.3rem 0.7rem;
+    border-radius: 5px;
+    border: 1px solid var(--accent, #4a7ef5);
+    background: rgba(74, 126, 245, 0.12);
+    color: var(--accent, #4a7ef5);
+    font-size: 0.76rem;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .partial-btn:not(:disabled):hover { background: rgba(74, 126, 245, 0.22); }
+  .partial-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 </style>

@@ -125,18 +125,22 @@ Integration tests use real temp git repos (no mocks).
    - Already-applied commits (`git cherry`) are dimmed and marked **Applied**
    - Click a commit to open the **detail panel** below (message body + file list with +/- stats)
    - Click a file in the detail panel to open the **side-by-side diff viewer** in a new window
+   - **Partial-file pick (M11c):** tick individual files in the detail panel and click **Pick N files → \<target\>** to apply only those files of a commit as a new commit
 5. **Target branch** dropdown (right) — where commits will land (default: current branch); **Create Branch** button to create a new branch on the fly
+   - **Squash (M11b):** tick **Squash into one** in the queue header to fold all queued commits into a single commit (with an editable message)
+   - **Edit message (M11b):** the ✎ button on a queued commit overrides its message before applying
 6. Click **Apply** (or use the ▾ dropdown for **Apply & Push → \<remote\>**, or **Apply & Push & Create PR**) — runs `git cherry-pick` sequentially:
    - Progress bar shows `n/total — sha` for each commit as it applies
    - **Cancel** button aborts mid-batch and restores the repo to a clean state
    - Already-applied (empty) commits are auto-skipped with a toast
+   - **Auto-stash (M11a):** with the setting on, uncommitted changes are stashed before the batch and restored after
    - On conflict: **ConflictResolver** panel appears
      - **Keep Ours / Use Theirs** — one-click resolution per file
      - Click filename → opens the **3-pane merge editor** (TortoiseGit style) with inline per-block action buttons, cross-pane combine, and keyboard navigation
      - **🤖 AI resolve all** (if enabled in Settings) — shells out to your installed headless AI CLI (Claude Code, etc.) to merge every conflicting file, then lets you **Review** each result (3-way view identical to the manual editor, or your external merge tool), **Accept & stage** or **Discard** — see [AI conflict resolution](#ai-conflict-resolution-desktop--ai-cli) below
      - **Continue →** after all files resolved; **Abort** to cancel
    - Result shown via Toast (success / skipped) or the conflict banner
-7. **Settings** (gear icon) — theme, max commits, EOL markers, **AI conflict resolution** (headless AI CLI), external diff/merge tools (TortoiseGit/Beyond Compare/WinMerge/VS Code), auto-updater, and **Connect** GitHub/GitLab/Bitbucket for one-click PR/MR creation after applying
+7. **Settings** (gear icon) — theme, max commits, EOL markers, **auto-stash before apply** (M11a), **AI conflict resolution** (headless AI CLI), external diff/merge tools (TortoiseGit/Beyond Compare/WinMerge/VS Code), auto-updater, and **Connect** GitHub/GitLab/Bitbucket for one-click PR/MR creation after applying. The **Accounts** tab (M14f) lists all your connected repos with per-repo **Test / Reconnect / Disconnect**, and can connect a recent repo without opening it
 
 ## AI conflict resolution (desktop → AI CLI)
 
@@ -229,6 +233,10 @@ See [docs/IPC.md](./docs/IPC.md) for all NDJSON method signatures, or [docs/MCP.
 - ✅ **M14** PR/MR creation for GitHub, GitLab, and Bitbucket Cloud — OS-keychain tokens, PR status bar with hover preview, "Apply & Push & Create PR" flow
 - ✅ **M15a** MCP server — sidecar doubles as a 22-tool MCP server (`--mcp`) for AI clients, with an AI-driven conflict-resolution loop
 - ✅ **M16** AI conflict resolution (desktop → headless AI CLI) — "🤖 AI resolve all", review-before-stage with a 3-way view matching the manual editor (or external merge tool), provider-agnostic presets (Claude Code verified), AI calls logged in the Git Console
+- ✅ **M11** Advanced pick — auto-stash before apply (M11a), squash queued commits into one + per-commit message override (M11b), partial-file pick (M11c)
+- ✅ **M14f** Accounts tab — manage forge connections across all repos (Test / Reconnect / Disconnect), connect a recent repo without opening it
+- 🔜 **M12** Performance & large repos — virtual scroll (drop the maxCommits ceiling), background fetch, per-branch cache
+- 🔜 **M14e** Multi-forge per repo — connect one repo to several forges, pick forge per remote, warn on remote/forge mismatch
 - 🔜 **M15b+** — forge tools over MCP, MCP Sampling, further polish
 
 See [CLAUDE.md](./CLAUDE.md) for the full per-milestone changelog.

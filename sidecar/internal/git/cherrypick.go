@@ -8,6 +8,10 @@ type CherryPickArgs struct {
 	Target   string   `json:"target"`
 	Shas     []string `json:"shas"`
 	Strategy string   `json:"strategy"` // "smart" (default), "theirs"/"incoming", "ours"
+	// Messages maps a full SHA → replacement commit message (M11b edit-message).
+	// After a commit is picked, if its SHA has a non-empty entry the commit is
+	// amended (`git commit --amend -m`). Absent/empty → keep the original message.
+	Messages map[string]string `json:"messages"`
 	// OnProgress is called after each successful commit with 1-based index and
 	// total count. Not serialised — injected by the RPC handler in main.go.
 	OnProgress func(n, total int, sha string) `json:"-"`
@@ -105,6 +109,12 @@ func (r *Repo) CherryPick(ctx context.Context, args CherryPickArgs) (*CherryPick
 					"applied":   result.Applied,
 					"conflicts": result.Conflicts,
 				},
+			}
+		}
+		// M11b — apply a per-commit message override by amending the just-made commit.
+		if msg := args.Messages[sha]; msg != "" {
+			if _, err := run(ctx, r.Path, "commit", "--amend", "-m", msg); err != nil {
+				return result, err
 			}
 		}
 		result.Applied = append(result.Applied, sha)

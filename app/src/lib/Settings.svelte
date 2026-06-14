@@ -2,7 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { getVersion } from "@tauri-apps/api/app";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import type { AppSettings, DetectedTool, DetectedAi, ForgeConnection } from "./rpc-types";
+  import type { AppSettings, DetectedTool, DetectedAi, ForgeConnection, ForgeConnectionTest } from "./rpc-types";
   import { AI_PROVIDERS, findProvider } from "./ai-providers";
 
   interface Props {
@@ -14,11 +14,46 @@
     forgeConnection?: ForgeConnection | null;
     /** True when a repo is open — controls availability of Connect/Disconnect. */
     forgeConnectAvailable?: boolean;
-    onconnectforge?: () => void;
-    ondisconnectforge?: () => void;
+    /** M14f — path of the currently-open repo ("" if none), to badge "current". */
+    currentRepo?: string;
+    /** M14f — recently-opened repo paths, for the "connect another repo" dropdown. */
+    recents?: string[];
+    /** Called with the repo path to connect/disconnect/test. */
+    onconnectforge?: (repoPath: string) => void;
+    ondisconnectforge?: (repoPath: string) => void;
+    /** M14f — test a saved connection; resolves on success, rejects on auth failure. */
+    ontestforge?: (repoPath: string) => Promise<ForgeConnectionTest>;
   }
 
-  let { settings, onclose, onsave, onchecknow, forgeConnection = null, forgeConnectAvailable = false, onconnectforge, ondisconnectforge }: Props = $props();
+  let { settings, onclose, onsave, onchecknow, forgeConnection = null, forgeConnectAvailable = false, currentRepo = "", recents = [], onconnectforge, ondisconnectforge, ontestforge }: Props = $props();
+
+  // ── M14f — Accounts management state ──────────────────────
+  /** Per-repo test status shown inline in the Accounts list. */
+  let forgeTest = $state<Record<string, { status: "testing" | "ok" | "err"; msg?: string }>>({});
+  /** Selected repo path in the "connect another repo" dropdown. */
+  let connectPick = $state("");
+
+  const connectedRepos = $derived(Object.keys(settings.forgeConnections ?? {}).sort());
+  // Recents that aren't already connected — candidates for a new connection.
+  const connectableRecents = $derived(recents.filter((p) => !(settings.forgeConnections ?? {})[p]));
+
+  function repoName(path: string): string {
+    return path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path;
+  }
+  function forgeLabel(kind: string): string {
+    return kind === "github" ? "GitHub" : kind === "gitlab" ? "GitLab" : kind === "bitbucket" ? "Bitbucket" : kind;
+  }
+
+  async function testForge(path: string) {
+    if (!ontestforge) return;
+    forgeTest = { ...forgeTest, [path]: { status: "testing" } };
+    try {
+      const r = await ontestforge(path);
+      forgeTest = { ...forgeTest, [path]: { status: "ok", msg: `${r.username}${r.scopes.length ? " · " + r.scopes.join(", ") : ""}` } };
+    } catch (e) {
+      forgeTest = { ...forgeTest, [path]: { status: "err", msg: String(e) } };
+    }
+  }
 
   let activeTab = $state<"general" | "ai" | "tools" | "accounts">("general");
 
@@ -57,6 +92,7 @@
   let defaultApplyMode = $state(settings.defaultApplyMode);
   let showEolMarkers = $state(settings.showEolMarkers);
   let autoFetchOnOpen = $state(settings.autoFetchOnOpen);
+  let autoStash = $state(settings.autoStash);
   let checkForUpdatesOnStartup = $state(settings.checkForUpdatesOnStartup);
   let theme = $state(settings.theme);
   let checkingNow = $state(false);
@@ -129,7 +165,7 @@
 
   function save() {
     onsave({
-      maxCommits, defaultApplyMode, showEolMarkers, autoFetchOnOpen, theme,
+      maxCommits, defaultApplyMode, showEolMarkers, autoFetchOnOpen, autoStash, theme,
       externalDiffEnabled, externalDiffPath, externalDiffArgs,
       externalMergeEnabled, externalMergePath, externalMergeArgs,
       checkForUpdatesOnStartup,
@@ -287,6 +323,22 @@
               role="switch"
             >
               {autoFetchOnOpen ? "On" : "Off"}
+            </button>
+          </div>
+
+          <div class="setting-row">
+            <span class="setting-label">
+              Auto-stash before apply
+              <span class="setting-hint">Stash uncommitted changes before a cherry-pick batch and restore them after</span>
+            </span>
+            <button
+              class="toggle"
+              class:on={autoStash}
+              onclick={() => (autoStash = !autoStash)}
+              aria-checked={autoStash}
+              role="switch"
+            >
+              {autoStash ? "On" : "Off"}
             </button>
           </div>
 
@@ -601,31 +653,67 @@
 
         {:else if activeTab === "accounts"}
           <h3 class="tab-heading">Connected Accounts</h3>
+          <p class="tab-sub">Forge connections (for PR/MR creation), one per repository. Tokens live in the OS keychain.</p>
 
-          <div class="row">
-            <label class="label">Forge (for PR creation)</label>
-            <div class="forge-info">
-              {#if !forgeConnectAvailable}
-                <span class="hint">Open a repo to configure a forge connection.</span>
-              {:else if forgeConnection}
-                <span class="connected-label">
-                  <strong>{forgeConnection.kind === "github" ? "GitHub" : forgeConnection.kind === "gitlab" ? "GitLab" : "Bitbucket"}</strong>
-                  · {forgeConnection.host}
-                  · <span class="mono">{forgeConnection.username}</span>
-                </span>
-                <button class="forge-action danger" onclick={() => ondisconnectforge?.()}>
-                  Disconnect
-                </button>
-                <button class="forge-action" onclick={() => onconnectforge?.()}>
-                  Reconnect
-                </button>
-              {:else}
-                <span class="hint">No connection for this repo.</span>
-                <button class="forge-action primary" onclick={() => onconnectforge?.()}>
-                  Connect…
-                </button>
-              {/if}
+          {#if connectedRepos.length === 0}
+            <p class="hint acc-empty">
+              {forgeConnectAvailable
+                ? "No forge connections yet. Connect the current repo below, or pick a recent one."
+                : "Open a repo to configure a forge connection — or pick a recent repo below."}
+            </p>
+          {:else}
+            <div class="acc-list">
+              {#each connectedRepos as path (path)}
+                {@const conn = (settings.forgeConnections ?? {})[path]}
+                {@const t = forgeTest[path]}
+                <div class="acc-card">
+                  <div class="acc-card-main">
+                    <div class="acc-repo">
+                      <span class="acc-repo-name" title={path}>{repoName(path)}</span>
+                      {#if path === currentRepo}<span class="acc-badge">current</span>{/if}
+                    </div>
+                    <div class="acc-conn">
+                      <strong>{forgeLabel(conn.kind)}</strong> · {conn.host} · <span class="mono">{conn.username}</span>
+                    </div>
+                    {#if t}
+                      <div class="acc-test-result" class:ok={t.status === "ok"} class:err={t.status === "err"}>
+                        {#if t.status === "testing"}⏳ Testing…
+                        {:else if t.status === "ok"}✓ {t.msg}
+                        {:else}✗ {t.msg}{/if}
+                      </div>
+                    {/if}
+                  </div>
+                  <div class="acc-actions">
+                    <button class="forge-action" onclick={() => testForge(path)} disabled={t?.status === "testing"} title="Test the saved token">Test</button>
+                    <button class="forge-action" onclick={() => onconnectforge?.(path)} title="Re-enter token / change account">Reconnect</button>
+                    <button class="forge-action danger" onclick={() => ondisconnectforge?.(path)} title="Remove this connection">Disconnect</button>
+                  </div>
+                </div>
+              {/each}
             </div>
+          {/if}
+
+          <div class="acc-connect-new">
+            <label class="label">Connect a repo</label>
+            <div class="acc-connect-row">
+              <select class="acc-select" bind:value={connectPick}>
+                <option value="">{connectableRecents.length ? "Select a recent repo…" : "No unconnected recent repos"}</option>
+                {#if currentRepo && !settings.forgeConnections?.[currentRepo]}
+                  <option value={currentRepo}>{repoName(currentRepo)} (current)</option>
+                {/if}
+                {#each connectableRecents as p (p)}
+                  {#if p !== currentRepo}<option value={p}>{repoName(p)}</option>{/if}
+                {/each}
+              </select>
+              <button
+                class="forge-action primary"
+                disabled={!connectPick}
+                onclick={() => { if (connectPick) { onconnectforge?.(connectPick); connectPick = ""; } }}
+              >
+                Connect…
+              </button>
+            </div>
+            <span class="hint acc-connect-hint">Reconnecting/connecting opens the token dialog; the repo doesn't need to be open.</span>
           </div>
         {/if}
       </div>
@@ -788,6 +876,12 @@
     color: var(--text-secondary, #ccc);
     flex: 1;
   }
+  .setting-hint {
+    display: block;
+    font-size: 0.72rem;
+    color: var(--text-muted, #888);
+    margin-top: 0.15rem;
+  }
   .setting-input {
     width: 90px;
     padding: 0.28rem 0.5rem;
@@ -871,6 +965,52 @@
   .forge-action.primary:hover { filter: brightness(1.1); }
   .forge-action.danger { color: #ff8888; border-color: #6a3030; }
   .forge-action.danger:hover { background: rgba(224, 85, 85, 0.12); }
+  .forge-action:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  /* ── M14f — Accounts management ── */
+  .tab-sub { font-size: 0.8rem; color: var(--text-muted, #888); margin: 0 0 0.4rem; }
+  .acc-empty { margin: 0.4rem 0; }
+  .mono { font-family: ui-monospace, monospace; color: var(--text, #f0f0f0); }
+  .acc-list { display: flex; flex-direction: column; gap: 0.5rem; margin-bottom: 0.9rem; }
+  .acc-card {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.5rem 0.65rem;
+    border: 1px solid var(--border, #3a3a3a);
+    border-radius: 6px;
+    background: var(--input-bg, #1e1e1e);
+  }
+  .acc-card-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 0.15rem; }
+  .acc-repo { display: flex; align-items: center; gap: 0.4rem; }
+  .acc-repo-name { font-size: 0.85rem; font-weight: 600; color: var(--text, #f0f0f0); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .acc-badge {
+    flex-shrink: 0;
+    font-size: 0.66rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--accent, #4a7ef5);
+    border: 1px solid var(--accent, #4a7ef5);
+    border-radius: 3px;
+    padding: 0 0.3rem;
+  }
+  .acc-conn { font-size: 0.78rem; color: var(--text-secondary, #bbb); }
+  .acc-test-result { font-size: 0.74rem; color: var(--text-muted, #888); }
+  .acc-test-result.ok { color: #66bb6a; }
+  .acc-test-result.err { color: #e05555; }
+  .acc-actions { flex-shrink: 0; display: flex; gap: 0.35rem; align-items: center; }
+  .acc-connect-new { display: flex; flex-direction: column; gap: 0.35rem; margin-top: 0.5rem; padding-top: 0.7rem; border-top: 1px solid var(--border-subtle, #2e2e2e); }
+  .acc-connect-row { display: flex; gap: 0.5rem; align-items: center; }
+  .acc-select {
+    flex: 1;
+    padding: 0.35rem 0.5rem;
+    border-radius: 5px;
+    border: 1px solid var(--border, #555);
+    background: var(--input-bg, #1e1e1e);
+    color: var(--text, #f0f0f0);
+    font-size: 0.82rem;
+  }
+  .acc-connect-hint { font-size: 0.72rem; }
 
   /* ── auto-detect ── */
   .detect-row {

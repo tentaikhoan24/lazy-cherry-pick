@@ -340,6 +340,10 @@ struct AppSettings {
     external_merge_args: String,
     #[serde(rename = "checkForUpdatesOnStartup", default = "default_true")]
     check_for_updates_on_startup: bool,
+    /// M11a — auto-stash uncommitted changes before a cherry-pick batch and
+    /// pop them once the whole flow finishes. Off by default for safety.
+    #[serde(rename = "autoStash", default)]
+    auto_stash: bool,
     /// M16/M16b — AI conflict resolution via a headless AI CLI agent
     /// (Claude Code / Gemini / Codex / Aider / custom). The engine is generic;
     /// `ai_provider` only remembers which preset the UI last applied.
@@ -407,6 +411,7 @@ impl Default for AppSettings {
             external_merge_path: String::new(),
             external_merge_args: String::new(),
             check_for_updates_on_startup: true,
+            auto_stash: false,
             ai_enabled: false,
             ai_provider: default_ai_provider(),
             ai_command: String::new(),
@@ -815,6 +820,30 @@ async fn forge_test_connection(
 }
 
 #[tauri::command]
+// M14f — test an ALREADY-SAVED connection: loads the token from the keychain
+// (the frontend never sees it) and re-runs the provider's auth check. Useful to
+// verify a stored token still works after sitting unused for a while.
+async fn forge_test_saved_connection(
+    app: tauri::AppHandle,
+    repo_path: String,
+) -> Result<forge::ConnectionTestResult, String> {
+    let settings = settings_load(app)?;
+    let conn = settings
+        .forge_connections
+        .get(&repo_path)
+        .ok_or_else(|| "no forge connection configured for this repo".to_string())?;
+    let kind = parse_forge_kind(&conn.kind)?;
+    let token = forge::token_load(&kind, &conn.host, &conn.username).map_err(|e| {
+        format!(
+            "token not found in keychain for key '{}:{}:{}' ({e}) — please reconnect",
+            conn.kind, conn.host, conn.username
+        )
+    })?;
+    let provider = forge::provider_for(&kind, &conn.base_url, &conn.username);
+    provider.test_connection(&token).await
+}
+
+#[tauri::command]
 fn forge_save_connection(
     app: tauri::AppHandle,
     repo_path: String,
@@ -959,6 +988,7 @@ pub fn run() {
             detect_ai_tool,
             run_ai_resolve,
             forge_test_connection,
+            forge_test_saved_connection,
             forge_save_connection,
             forge_delete_connection,
             forge_create_pr,

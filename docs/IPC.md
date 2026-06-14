@@ -228,6 +228,7 @@ Params:
   target: string;      // branch to apply commits onto
   shas: string[];      // ordered list of commit SHAs to apply
   strategy?: "smart" | "theirs" | "ours";  // default: "smart" (no --strategy-option)
+  messages?: Record<string, string>;  // M11b — full SHA → replacement commit message; amended after each pick
 }
 ```
 
@@ -451,11 +452,11 @@ Resolves a conflict file by checking out one side (`git checkout --ours/--theirs
 
 ### `git.continueCherry`
 
-Params: `{ repo: string }`
+Params: `{ repo: string; message?: string }`
 
-Result: `{ sha: string }`
+Result: `{ done: boolean }`
 
-Runs `git cherry-pick --continue --no-edit` to complete a cherry-pick after all conflicts are resolved and staged. Returns the new commit SHA.
+Runs `git cherry-pick --continue --no-edit` to complete a cherry-pick after all conflicts are resolved and staged. If the resumed commit turns out empty, falls back to `git cherry-pick --skip`. M11b: a non-empty `message` amends the resumed commit (`git commit --amend -m`) with the per-commit override (skipped when the commit was `--skip`ped).
 
 ---
 
@@ -486,6 +487,48 @@ Params: `{ leftText: string; rightText: string }` (no `repo` — operates on tem
 Result: `{ sha: ""; file: ""; diff: string }` (same `FileDiffResult` shape; raw unified diff)
 
 Produces a unified diff between two arbitrary text blobs by writing them to temp files and running `git diff --no-index --unified=99999`. Used by the AI-review modal to show "[conflict original] vs [AI resolved]" without either side being a git ref. `git diff --no-index` exits 1 when the files differ — the sidecar treats that as "differences found" (normal) and returns the captured diff; exit 0 yields an empty diff.
+
+---
+
+### `git.stash` (M11a)
+
+Params: `{ repo: string; message: string; includeUntracked: boolean }`
+
+Result: `{ stashed: boolean }`
+
+Runs `git stash push [-u] -m <message>`. `stashed` is `false` when the working tree was already clean (git prints "No local changes to save") — not an error. Used by the desktop app's auto-stash: it stashes uncommitted work **before** a cherry-pick batch (so the sidecar's clean-tree requirement is satisfied), then pops it once the whole flow finishes. The frontend orchestrates the lifecycle because the conflict path spans multiple RPC calls.
+
+---
+
+### `git.stashPop` (M11a)
+
+Params: `{ repo: string; message: string }`
+
+Result: `{ popped: boolean }`
+
+Pops the most recent stash entry whose message contains `message` (scans `git stash list`), so only the app's own `lcp-autostash` entry is ever popped — never one the user created manually. With an empty `message` it pops `stash@{0}`. Returns `popped: false` when no matching entry exists (idempotent). A pop that itself conflicts surfaces as an error.
+
+---
+
+### `git.squashCommits` (M11b)
+
+Params: `{ repo: string; base: string; message: string }`
+
+Result: `{ squashed: boolean }`
+
+Folds every commit added since `base` into a single commit: `git reset --soft <base>` then `git commit -m <message>`. `base` is the target branch tip SHA the caller captured **before** the cherry-pick batch (robust across skipped/conflicted commits, since they're all linear on top of `base`). Returns `squashed: false` (no commit made) when nothing was added (`HEAD` already at `base` / nothing staged), so the caller can squash unconditionally and get a no-op for a single commit. The desktop app runs this as a finalize step after the whole pick flow ends — before popping any auto-stash.
+
+---
+
+### `git.partialPick` (M11c)
+
+Params: `{ repo: string; target: string; sha: string; keep: string[]; message?: string }`
+
+Result: `{ sha: string; kept: string[] }`
+
+Applies only the `keep` files of commit `sha` onto `target` as a new commit. Flow: dirty-tree check → checkout `target` if needed → `git cherry-pick -n <sha>` (stage everything, no commit) → `git restore --source=HEAD --staged --worktree -- <unwanted>` to revert every changed file not in `keep` (also removes added files / restores deleted ones) → `git commit` with `-C <sha>` (reuse original message + authorship) or `-m message` if provided. Returns the new commit SHA.
+
+Errors: `-32002` (dirty tree); a conflict during the `-n` pick discards everything (`reset --hard`) and returns `-32003` ("pick the whole commit to resolve conflicts") — partial pick only handles conflict-free commits; selecting files with no net change in the commit also errors (after cleanup).
 
 ---
 

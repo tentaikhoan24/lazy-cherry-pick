@@ -707,7 +707,9 @@ func registerTools(s *Server) {
 			if err != nil {
 				return callToolResult{}, err
 			}
-			res, err := r.ContinueCherry(ctx, struct{}{})
+			// MCP doesn't expose the M11b edit-message override — always keep the
+			// original commit message here. (Desktop app uses ContinueCherryArgs.Message.)
+			res, err := r.ContinueCherry(ctx, git.ContinueCherryArgs{})
 			if err != nil {
 				return callToolResult{}, err
 			}

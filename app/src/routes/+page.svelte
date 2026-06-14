@@ -29,7 +29,7 @@
     maxCommits: 100, defaultApplyMode: "apply", showEolMarkers: false, autoFetchOnOpen: false, theme: "dark",
     externalDiffEnabled: false, externalDiffPath: "", externalDiffArgs: "",
     externalMergeEnabled: false, externalMergePath: "", externalMergeArgs: "",
-    checkForUpdatesOnStartup: true,
+    checkForUpdatesOnStartup: true, autoStash: false,
     aiEnabled: false, aiProvider: "claude", aiCommand: "", aiArgs: AI_PROVIDERS[0].args,
     aiModel: "", aiPromptVia: "stdin", aiOutputFormat: "claude-json", aiTimeoutSecs: 120,
   };
@@ -146,6 +146,9 @@
   // ── M14 forge connection ─────────────────────────────────
   let forgeConnection = $state<ForgeConnection | null>(null);
   let connectForgeOpen = $state(false);
+  // M14f — which repo the ConnectForge dialog targets (may differ from the open repo).
+  let connectForgeRepo = $state("");
+  let connectForgeRemotes = $state<Remote[]>([]);
   let createPrOpen = $state(false);
   /** Snapshot of commits just applied — passed to CreatePR for title/body. */
   let lastAppliedCommits = $state<Commit[]>([]);
@@ -155,6 +158,16 @@
    * Set by applyPick/applyPushCreatePR. Consumed by both the success path of
    * applyPickShas and the success path of continueCherry. */
   let pendingFinalize = $state<{ remote: string; createPr: boolean } | null>(null);
+  /** M11a — true when applyPick auto-stashed uncommitted work; survives conflict
+   * resolution so the stash is popped only once the whole flow ends. */
+  let pendingAutoStashPop = $state(false);
+  const AUTO_STASH_MSG = "lcp-autostash";
+  // ── M11b — advanced pick: squash + per-commit message override ──
+  let squashMode = $state(false);
+  let squashMessage = $state("");
+  let messageOverrides = $state(new Map<string, string>());
+  let squashBase = $state(""); // target tip SHA captured before a squash apply
+  let partialPicking = $state(false); // M11c — partial-file pick in flight
   /** Open PRs for the current target branch — used to show "PR #N open" status
    * in PickQueue so the user knows if there's already a PR before they try to create one. */
   let targetBranchPRs = $state<PRSummary[]>([]);
@@ -168,6 +181,11 @@
   // ── selection: Map preserves insertion order for queue ─────
   let selectionMap = $state(new Map<string, Commit>());
   const queue = $derived([...selectionMap.values()]);
+  /** Squash only makes sense for ≥2 commits — a stale `squashMode=true` left
+   * over from a previous larger batch must not silently squash/rename a
+   * single-commit apply. Single source of truth for both UI (label, ✎
+   * visibility) and backend decisions (message overrides, squash capture). */
+  const squashActive = $derived(squashMode && queue.length > 1);
 
   // ── applied commits (already in target branch) ────────────
   let appliedShas = $state(new Set<string>());
@@ -273,7 +291,9 @@
   async function continueCherry() {
     conflictBusy = true;
     try {
-      await rpc.git.continueCherry(repoPath);
+      // M11b — amend the resolved commit with its message override (unless squashing).
+      const msgOverride = squashActive ? undefined : messageOverrides.get(conflictSha);
+      await rpc.git.continueCherry(repoPath, msgOverride);
       // The resolved commit is now committed. Find remaining queue commits to apply next.
       // (Sidecar applies one commit at a time — git's sequencer has no knowledge of the rest.)
       const resolvedSha = conflictSha;
@@ -316,6 +336,8 @@
       } else {
         showToast("success", `Conflict resolved — cherry-pick applied to ${targetBranch}`);
       }
+      // Whole flow finished via conflict resolution — squash (if on) then restore stash.
+      await finalizeBatchExtras();
     } catch (e) {
       // git cherry-pick --continue failed (e.g. unstaged files, or genuine error)
       applyError = e instanceof RpcCallError ? e.rpcError.message : String(e);
@@ -388,10 +410,12 @@
     applyResult = null;
     applyError = "";
     pendingFinalize = null; // user gave up — don't push/PR on next action
+    squashBase = ""; // don't squash a partially-applied/aborted batch
     aiResolved = new Map();
     aiBackup = new Map();
     aiReviewOpen = false;
     conflictBusy = false;
+    await maybePopAutoStash(); // restore the user's stashed work after aborting
     showToast("warning", "Cherry-pick aborted.");
   }
 
@@ -904,6 +928,8 @@
     busy = false;
     progress = null;
     pendingFinalize = null;
+    squashBase = ""; // don't squash a cancelled batch
+    await maybePopAutoStash(); // restore the user's stashed work after cancelling
     showToast("warning", "Cherry-pick cancelled.");
   }
 
@@ -943,9 +969,11 @@
     applyResult = null;
     applyError = "";
     try {
+      // M11b — pass per-commit message overrides (ignored when squashing).
+      const msgRecord = squashActive ? undefined : Object.fromEntries(messageOverrides);
       const pickResult = await rpc.git.cherryPick(
         repoPath, targetBranch, shas, undefined,
-        (p) => { progress = p; }
+        (p) => { progress = p; }, msgRecord
       );
       // success — clear selection, refresh branches
       selectionMap = new Map();
@@ -977,6 +1005,8 @@
         });
         showToast("warning", `Skipped ${skippedShas.length} commit${skippedShas.length === 1 ? "" : "s"} — already applied`, labels.join("\n"));
       }
+      // Whole batch applied with no conflict — squash (if on) then restore stash.
+      await finalizeBatchExtras();
     } catch (e) {
       if (e instanceof RpcCallError) {
         if (e.rpcError.code === -32003) {
@@ -992,11 +1022,14 @@
             }
             await loadRemainingCommitFiles(conflicts[0].sha);
           }
+          // Conflict — keep the stash; it's popped after continue/abort finishes the flow.
         } else {
           showToast("error", `[${e.rpcError.code}] ${e.rpcError.message}`);
+          await maybePopAutoStash();
         }
       } else {
         showToast("error", String(e));
+        await maybePopAutoStash();
       }
     } finally {
       busy = false;
@@ -1004,9 +1037,105 @@
     }
   }
 
+  /** M11a — stash uncommitted work before a batch if the setting is on.
+   * Returns false only when the stash itself failed (caller should abort). */
+  async function maybeAutoStash(): Promise<boolean> {
+    pendingAutoStashPop = false;
+    if (!settings.autoStash || !repoPath) return true;
+    try {
+      const r = await rpc.git.stash(repoPath, AUTO_STASH_MSG, true);
+      if (r.stashed) {
+        pendingAutoStashPop = true;
+        showToast("success", "Stashed uncommitted changes — will restore after");
+      }
+      return true;
+    } catch (e) {
+      showToast("error", "Auto-stash failed", e instanceof RpcCallError ? e.rpcError.message : String(e));
+      return false;
+    }
+  }
+
+  /** M11a — pop the auto-stash once the whole cherry-pick flow has ended
+   * (success or abort). No-op unless this run actually stashed. */
+  async function maybePopAutoStash() {
+    if (!pendingAutoStashPop || !repoPath) return;
+    pendingAutoStashPop = false;
+    try {
+      const r = await rpc.git.stashPop(repoPath, AUTO_STASH_MSG);
+      if (r.popped) showToast("success", "Restored your stashed changes");
+    } catch (e) {
+      showToast("error", "Couldn't restore stash — resolve, then run `git stash pop` manually",
+        e instanceof RpcCallError ? e.rpcError.message : String(e));
+    }
+  }
+
+  /** M11b — default squash message: each queued commit's subject, one per line. */
+  function defaultSquashMessage(): string {
+    return queue.map((c) => c.subject).join("\n");
+  }
+
+  /** M11b — capture the target branch tip before a squash batch so we can later
+   * `reset --soft` back to it. No-op unless squashing is actually active (≥2 commits). */
+  async function captureSquashBase() {
+    squashBase = "";
+    if (!squashActive || !repoPath) return;
+    try {
+      const cs = await rpc.git.commits(repoPath, targetBranch, 1, 0, {});
+      squashBase = cs[0]?.sha ?? "";
+    } catch { squashBase = ""; }
+  }
+
+  /** M11b — run after a batch fully succeeds (no pending conflict): squash the
+   * picked commits into one (if squashMode), then pop the auto-stash. Order
+   * matters — squash must finish before the stash is restored. */
+  async function finalizeBatchExtras() {
+    if (squashMode && squashBase && repoPath) {
+      try {
+        const r = await rpc.git.squashCommits(repoPath, squashBase, squashMessage.trim() || "Squashed commit");
+        if (r.squashed) {
+          showToast("success", "Squashed picked commits into one");
+          branches = await rpc.git.branches(repoPath, true);
+          const updated = branches.find((b) => b.isHead);
+          if (updated) currentBranch = updated.name;
+          await refreshApplied();
+        }
+      } catch (e) {
+        showToast("error", "Squash failed", e instanceof RpcCallError ? e.rpcError.message : String(e));
+      }
+    }
+    squashBase = "";
+    messageOverrides = new Map();
+    squashMessage = "";
+    await maybePopAutoStash();
+  }
+
+  /** M11c — apply only the selected files of the currently-detailed commit
+   * onto the target branch as a new commit. Wrapped with auto-stash. */
+  async function partialPick(keep: string[]) {
+    if (!repoPath || !selectedCommit || keep.length === 0) return;
+    partialPicking = true;
+    if (!(await maybeAutoStash())) { partialPicking = false; return; }
+    try {
+      const res = await rpc.git.partialPick(repoPath, targetBranch, selectedCommit.sha, keep);
+      showToast("success", `Picked ${res.kept.length} file${res.kept.length === 1 ? "" : "s"} from ${selectedCommit.sha.slice(0, 7)} → ${targetBranch}`);
+      branches = await rpc.git.branches(repoPath, true);
+      const updated = branches.find((b) => b.isHead);
+      if (updated) currentBranch = updated.name;
+      await refreshApplied();
+    } catch (e) {
+      if (e instanceof RpcCallError) showToast("error", `[${e.rpcError.code}] ${e.rpcError.message}`);
+      else showToast("error", String(e));
+    } finally {
+      await maybePopAutoStash();
+      partialPicking = false;
+    }
+  }
+
   async function applyPick(andPush = false, pushRemote = "origin") {
     if (!repoPath || queue.length === 0) return;
     pendingFinalize = andPush ? { remote: pushRemote, createPr: false } : null;
+    await captureSquashBase();
+    if (!(await maybeAutoStash())) return;
     await applyPickShas(queue.map((c) => c.sha), andPush, pushRemote);
   }
 
@@ -1060,13 +1189,39 @@
 
   /** Refresh forgeConnection from settings (after Save in ConnectForge). */
   async function refreshForgeConnection() {
-    if (!repoPath) return;
     try {
       const s = await rpc.settings.load();
       settings = s;
-      forgeConnection = s.forgeConnections?.[repoPath] ?? null;
+      forgeConnection = repoPath ? (s.forgeConnections?.[repoPath] ?? null) : null;
     } catch {
       /* ignore */
+    }
+  }
+
+  /** M14f — open the Connect dialog for an arbitrary repo (may not be the open one). */
+  async function openConnectForge(path: string) {
+    if (!path) return;
+    let rem: Remote[] = [];
+    if (path === repoPath) {
+      rem = remotes;
+    } else {
+      try { rem = await rpc.git.remotes(path); } catch { rem = []; }
+    }
+    connectForgeRepo = path;
+    connectForgeRemotes = rem;
+    // Keep Settings open underneath — ConnectForge overlays on top of it and
+    // closing it returns to Settings (M14f UX fix).
+    connectForgeOpen = true;
+  }
+
+  /** M14f — disconnect a forge connection for an arbitrary repo. */
+  async function disconnectForge(path: string) {
+    try {
+      await rpc.forge.deleteConnection(path);
+      await refreshForgeConnection();
+      showToast("success", "Forge connection removed");
+    } catch (e) {
+      showToast("error", `Could not disconnect: ${String(e)}`);
     }
   }
 
@@ -1149,6 +1304,8 @@
     // pendingFinalize survives across conflict resolution so the PR dialog
     // opens even if cherry-pick stops mid-way for a conflict.
     pendingFinalize = { remote, createPr: true };
+    await captureSquashBase();
+    if (!(await maybeAutoStash())) return;
     await applyPickShas(snapshot.map((c) => c.sha), true, remote);
   }
 
@@ -1263,6 +1420,16 @@
           onapplypushpr={(remote) => applyPushCreatePR(remote)}
           oncancel={cancelPick}
           oncreate={createBranch}
+          squashMode={squashActive}
+          {squashMessage}
+          {messageOverrides}
+          onsquashtoggle={(on) => { squashMode = on; if (on && !squashMessage.trim()) squashMessage = defaultSquashMessage(); }}
+          onsquashmessage={(m) => (squashMessage = m)}
+          oneditmessage={(sha, msg) => {
+            const m = new Map(messageOverrides);
+            if (msg) m.set(sha, msg); else m.delete(sha);
+            messageOverrides = m;
+          }}
         />
       </div>
     </div>
@@ -1285,6 +1452,9 @@
             loading={loadingDetail}
             selectedPath={selectedFile?.path ?? ""}
             onselect={selectFile}
+            target={targetBranch}
+            picking={partialPicking}
+            onpartialpick={partialPick}
           />
         {/if}
       </div>
@@ -1350,27 +1520,21 @@
       {settings}
       forgeConnection={forgeConnection}
       forgeConnectAvailable={!!repoPath}
+      currentRepo={repoPath}
+      recents={recentRepos.map((r) => r.path)}
       onclose={() => (settingsOpen = false)}
       onsave={saveSettings}
       onchecknow={checkForUpdates}
-      onconnectforge={() => { settingsOpen = false; connectForgeOpen = true; }}
-      ondisconnectforge={async () => {
-        if (!repoPath) return;
-        try {
-          await rpc.forge.deleteConnection(repoPath);
-          await refreshForgeConnection();
-          showToast("success", "Forge connection removed");
-        } catch (e) {
-          showToast("error", `Could not disconnect: ${String(e)}`);
-        }
-      }}
+      onconnectforge={openConnectForge}
+      ondisconnectforge={disconnectForge}
+      ontestforge={(path) => rpc.forge.testSavedConnection(path)}
     />
   {/if}
 
-  {#if connectForgeOpen && repoPath}
+  {#if connectForgeOpen && connectForgeRepo}
     <ConnectForge
-      {repoPath}
-      {remotes}
+      repoPath={connectForgeRepo}
+      remotes={connectForgeRemotes}
       onclose={() => (connectForgeOpen = false)}
       onsaved={async () => {
         await refreshForgeConnection();

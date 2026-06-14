@@ -33,9 +33,22 @@
     onapplypushpr: (remote: string) => void;
     oncancel: () => void;
     oncreate: (name: string, base: string) => void;
+    // ── M11b — advanced pick ──────────────────────────────────
+    /** Squash all queued commits into one on apply. */
+    squashMode?: boolean;
+    /** Message for the squashed commit (used only when squashMode). */
+    squashMessage?: string;
+    /** Per-SHA commit-message overrides (used when NOT squashing). */
+    messageOverrides?: Map<string, string>;
+    onsquashtoggle?: (on: boolean) => void;
+    onsquashmessage?: (msg: string) => void;
+    oneditmessage?: (sha: string, msg: string) => void;
   }
 
-  let { queue, branches, remotes, targetBranch, sourceBranch, busy, progress, dryRunMap, defaultApplyMode = "apply", defaultPushRemote = "origin", forgeConnected = false, targetPRs = [], prCheckLoading = false, onopenpr, onrefreshprs, oncreatepr, ontargetbranch, onremove, onreorder, onapply, onapplypush, onapplypushpr, oncancel, oncreate }: Props = $props();
+  let { queue, branches, remotes, targetBranch, sourceBranch, busy, progress, dryRunMap, defaultApplyMode = "apply", defaultPushRemote = "origin", forgeConnected = false, targetPRs = [], prCheckLoading = false, onopenpr, onrefreshprs, oncreatepr, ontargetbranch, onremove, onreorder, onapply, onapplypush, onapplypushpr, oncancel, oncreate, squashMode = false, squashMessage = "", messageOverrides = new Map(), onsquashtoggle, onsquashmessage, oneditmessage }: Props = $props();
+
+  // M11b — which queue item has its inline message editor open.
+  let editingSha = $state<string | null>(null);
 
   // Target must be a LOCAL branch — cherry-picking onto a remote-tracking ref
   // (origin/main) puts the repo in detached HEAD. Source dropdown can still
@@ -75,12 +88,13 @@
     }
   });
 
+  const applyVerb = $derived(squashMode ? "Apply & Squash" : "Apply");
   const btnLabel = $derived(
     mode === "apply-push-pr"
-      ? `Apply & Push & PR ${queue.length > 0 ? queue.length : ""} commit${queue.length === 1 ? "" : "s"} → ${pushRemote}/${targetBranch}`
+      ? `${applyVerb} & Push & PR ${queue.length > 0 ? queue.length : ""} commit${queue.length === 1 ? "" : "s"} → ${pushRemote}/${targetBranch}`
       : mode === "apply-push"
-        ? `Apply & Push ${queue.length > 0 ? queue.length : ""} commit${queue.length === 1 ? "" : "s"} → ${pushRemote}/${targetBranch}`
-        : `Apply ${queue.length > 0 ? queue.length : ""} commit${queue.length === 1 ? "" : "s"} → ${targetBranch}`
+        ? `${applyVerb} & Push ${queue.length > 0 ? queue.length : ""} commit${queue.length === 1 ? "" : "s"} → ${pushRemote}/${targetBranch}`
+        : `${applyVerb} ${queue.length > 0 ? queue.length : ""} commit${queue.length === 1 ? "" : "s"} → ${targetBranch}`
   );
 
   // ── create branch inline form ─────────────────────────────
@@ -323,11 +337,34 @@
       </div>
     {:else}
       <div class="queue-header">
-        Pick queue — {queue.length} commit{queue.length === 1 ? "" : "s"}
+        <span>Pick queue — {queue.length} commit{queue.length === 1 ? "" : "s"}</span>
+        {#if queue.length > 1}
+          <label class="squash-toggle" title="Combine all queued commits into a single commit on apply">
+            <input
+              type="checkbox"
+              checked={squashMode}
+              disabled={busy}
+              onchange={(e) => onsquashtoggle?.((e.currentTarget as HTMLInputElement).checked)}
+            />
+            Squash into one
+          </label>
+        {/if}
       </div>
+      {#if squashMode && queue.length > 1}
+        <div class="squash-msg-wrap">
+          <textarea
+            class="squash-msg"
+            placeholder="Squashed commit message…"
+            value={squashMessage}
+            disabled={busy}
+            oninput={(e) => onsquashmessage?.((e.currentTarget as HTMLTextAreaElement).value)}
+          ></textarea>
+        </div>
+      {/if}
       <ul class="queue-list">
         {#each queue as c, i}
           {@const dryRun = dryRunMap.get(c.sha)}
+          {@const override = messageOverrides.get(c.sha)}
           <li
             class="queue-item"
             class:conflict={dryRun?.willConflict}
@@ -348,14 +385,32 @@
           >
             <span class="order">{i + 1}</span>
             <div class="commit-info">
-              <span class="subject" title={c.subject}>{c.subject}</span>
-              <span class="sha">{shortSha(c.sha)}</span>
+              <span class="subject" class:reworded={override} title={override ? `Reworded → ${override}` : c.subject}>{override || c.subject}</span>
+              <span class="sha">{shortSha(c.sha)}{#if override}<span class="reword-badge" title="Message overridden">✎</span>{/if}</span>
             </div>
             {#if dryRun?.willConflict}
               <span class="conflict-icon" title="Predicted conflict: {dryRun.files.length > 0 ? dryRun.files.join(', ') : 'unknown files'}">⚠</span>
             {/if}
+            {#if !squashMode}
+              <button class="edit-btn" onclick={() => editingSha = editingSha === c.sha ? null : c.sha} title="Edit commit message" disabled={busy}>✎</button>
+            {/if}
             <button class="remove-btn" onclick={() => onremove(c.sha)} title="Remove" disabled={busy}>✕</button>
           </li>
+          {#if editingSha === c.sha && !squashMode}
+            <li class="edit-row">
+              <input
+                class="edit-input"
+                placeholder={c.subject}
+                value={override ?? ""}
+                disabled={busy}
+                oninput={(e) => oneditmessage?.(c.sha, (e.currentTarget as HTMLInputElement).value)}
+                onkeydown={(e) => { if (e.key === 'Enter' || e.key === 'Escape') editingSha = null; }}
+              />
+              {#if override}
+                <button class="edit-clear" title="Reset to original" onclick={() => { oneditmessage?.(c.sha, ""); editingSha = null; }}>↺</button>
+              {/if}
+            </li>
+          {/if}
         {/each}
       </ul>
     {/if}
@@ -552,7 +607,81 @@
     text-transform: uppercase;
     letter-spacing: 0.04em;
     border-bottom: 1px solid var(--border-subtle, #2e2e2e);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
   }
+  /* M11b — squash toggle + message */
+  .squash-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 500;
+    color: var(--text-secondary, #aaa);
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .squash-toggle input { cursor: pointer; }
+  .squash-msg-wrap {
+    padding: 0.4rem 0.75rem;
+    border-bottom: 1px solid var(--border-subtle, #2e2e2e);
+  }
+  .squash-msg {
+    width: 100%;
+    min-height: 2.4rem;
+    resize: vertical;
+    padding: 0.35rem 0.5rem;
+    border-radius: 5px;
+    border: 1px solid var(--border, #555);
+    background: var(--input-bg, #1e1e1e);
+    color: var(--text, #f0f0f0);
+    font-size: 0.8rem;
+    font-family: inherit;
+  }
+  .subject.reworded { color: #d4a050; font-style: italic; }
+  .reword-badge { margin-left: 0.3rem; color: #d4a050; }
+  .edit-btn {
+    flex-shrink: 0;
+    background: none;
+    border: none;
+    color: var(--text-muted, #666);
+    cursor: pointer;
+    font-size: 0.8rem;
+    padding: 0.2rem 0.3rem;
+    border-radius: 4px;
+    line-height: 1;
+  }
+  .edit-btn:hover:not(:disabled) { color: #d4a050; background: rgba(212,160,80,0.12); }
+  .edit-btn:disabled { cursor: default; opacity: 0.3; }
+  .edit-row {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0 0.75rem 0.45rem 2.75rem;
+    border-bottom: 1px solid var(--border-subtle, #2e2e2e);
+  }
+  .edit-input {
+    flex: 1;
+    padding: 0.3rem 0.5rem;
+    border-radius: 5px;
+    border: 1px solid var(--border, #555);
+    background: var(--input-bg, #1e1e1e);
+    color: var(--text, #f0f0f0);
+    font-size: 0.8rem;
+  }
+  .edit-clear {
+    flex-shrink: 0;
+    background: none;
+    border: 1px solid var(--border, #555);
+    color: var(--text-secondary, #aaa);
+    cursor: pointer;
+    border-radius: 4px;
+    padding: 0.25rem 0.45rem;
+  }
+  .edit-clear:hover { color: var(--text, #f0f0f0); }
   .queue-list {
     list-style: none;
     margin: 0;

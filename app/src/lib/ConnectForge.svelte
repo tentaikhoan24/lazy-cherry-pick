@@ -294,7 +294,9 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 500;
+    /* Above the Settings modal (z-index 500) so Connect overlays on top of it
+       instead of replacing it — see M14f UX fix. */
+    z-index: 600;
   }
   .modal {
     width: min(520px, 92vw);

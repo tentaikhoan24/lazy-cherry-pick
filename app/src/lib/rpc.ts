@@ -87,12 +87,13 @@ export const rpc = {
       shas: string[],
       strategy?: "smart" | "theirs" | "ours",
       onprogress?: (p: CherryPickProgress) => void,
+      messages?: Record<string, string>,  // M11b — per-SHA message override
     ) => {
       const unlisten = onprogress
         ? await listen<CherryPickProgress>("cp-progress", (e) => onprogress(e.payload))
         : null;
       try {
-        return await call<CherryPickResult>("git.cherryPick", { repo, target, shas, strategy });
+        return await call<CherryPickResult>("git.cherryPick", { repo, target, shas, strategy, messages });
       } finally {
         unlisten?.();
       }
@@ -132,8 +133,16 @@ export const rpc = {
     resolveConflict: (repo: string, file: string, strategy: "ours" | "theirs") =>
       call<{ resolved: boolean }>("git.resolveConflict", { repo, file, strategy }),
 
-    continueCherry: (repo: string) =>
-      call<ContinueCherryResult>("git.continueCherry", { repo }),
+    continueCherry: (repo: string, message?: string) =>
+      call<ContinueCherryResult>("git.continueCherry", { repo, message }),
+
+    // M11b — squash commits added since `base` into one commit with `message`.
+    squashCommits: (repo: string, base: string, message: string) =>
+      call<{ squashed: boolean }>("git.squashCommits", { repo, base, message }),
+
+    // M11c — apply only `keep` files of commit `sha` onto `target` as a new commit.
+    partialPick: (repo: string, target: string, sha: string, keep: string[], message?: string) =>
+      call<{ sha: string; kept: string[] }>("git.partialPick", { repo, target, sha, keep, message }),
 
     fileContent: (repo: string, file: string) =>
       call<FileContentResult>("git.fileContent", { repo, file }),
@@ -162,6 +171,12 @@ export const rpc = {
 
     diffTexts: (leftText: string, rightText: string) =>
       call<FileDiffResult>("git.diffTexts", { leftText, rightText }),
+
+    // M11a — auto-stash. Stash before a cherry-pick batch, pop after the flow.
+    stash: (repo: string, message: string, includeUntracked: boolean) =>
+      call<{ stashed: boolean }>("git.stash", { repo, message, includeUntracked }),
+    stashPop: (repo: string, message: string) =>
+      call<{ popped: boolean }>("git.stashPop", { repo, message }),
   },
 
   // ── M14 — Forge integration (GitHub/GitLab PR creation) ──────────────────
@@ -171,6 +186,10 @@ export const rpc = {
   forge: {
     testConnection: (kind: ForgeKind, baseUrl: string, token: string, username?: string) =>
       invoke<ForgeConnectionTest>("forge_test_connection", { kind, baseUrl, token, username }),
+
+    // M14f — test an already-saved connection (token loaded from keychain in Rust).
+    testSavedConnection: (repoPath: string) =>
+      invoke<ForgeConnectionTest>("forge_test_saved_connection", { repoPath }),
 
     saveConnection: (args: {
       repoPath: string;

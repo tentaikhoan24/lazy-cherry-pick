@@ -88,6 +88,12 @@ func (r *Repo) RestoreConflict(ctx context.Context, args RestoreConflictArgs) (a
 
 // ── continue cherry-pick ──────────────────────────────────────────────────────
 
+type ContinueCherryArgs struct {
+	// Optional replacement message for the just-resolved commit (M11b edit-message).
+	// Empty → keep the original message.
+	Message string `json:"message"`
+}
+
 type ContinueCherryResult struct {
 	Done bool `json:"done"`
 }
@@ -96,15 +102,22 @@ type ContinueCherryResult struct {
 // conflicts are resolved. --no-edit skips the editor prompt entirely.
 // If the resolved commit turns out to be empty (e.g. the conflict was resolved
 // by accepting the target side), we skip it with --skip instead of failing.
-func (r *Repo) ContinueCherry(ctx context.Context, _ struct{}) (*ContinueCherryResult, error) {
+// A non-empty args.Message amends the resumed commit with that message.
+func (r *Repo) ContinueCherry(ctx context.Context, args ContinueCherryArgs) (*ContinueCherryResult, error) {
 	_, err := run(ctx, r.Path, "cherry-pick", "--continue", "--no-edit")
 	if err != nil {
 		if e, ok := err.(*Error); ok && (strings.Contains(e.Message, "now empty") || strings.Contains(e.Message, "cherry-pick --skip")) {
 			if _, skipErr := run(ctx, r.Path, "cherry-pick", "--skip"); skipErr == nil {
+				// Commit was skipped — no commit to amend, so ignore any message.
 				return &ContinueCherryResult{Done: true}, nil
 			}
 		}
 		return nil, err
+	}
+	if args.Message != "" {
+		if _, err := run(ctx, r.Path, "commit", "--amend", "-m", args.Message); err != nil {
+			return nil, err
+		}
 	}
 	return &ContinueCherryResult{Done: true}, nil
 }

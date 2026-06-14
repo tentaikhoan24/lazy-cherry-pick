@@ -327,12 +327,35 @@ func registerHandlers(s *rpc.Server) {
 
 	s.Register("git.continueCherry", wrap1(func(ctx context.Context, p struct {
 		Repo string `json:"repo"`
+		git.ContinueCherryArgs
 	}) (any, error) {
 		r, err := git.Open(ctx, p.Repo)
 		if err != nil {
 			return nil, err
 		}
-		return r.ContinueCherry(ctx, struct{}{})
+		return r.ContinueCherry(ctx, p.ContinueCherryArgs)
+	}))
+
+	s.Register("git.squashCommits", wrap1(func(ctx context.Context, p struct {
+		Repo string `json:"repo"`
+		git.SquashArgs
+	}) (any, error) {
+		r, err := git.Open(ctx, p.Repo)
+		if err != nil {
+			return nil, err
+		}
+		return r.SquashCommits(ctx, p.SquashArgs)
+	}))
+
+	s.Register("git.partialPick", wrap1(func(ctx context.Context, p struct {
+		Repo string `json:"repo"`
+		git.PartialPickArgs
+	}) (any, error) {
+		r, err := git.Open(ctx, p.Repo)
+		if err != nil {
+			return nil, err
+		}
+		return r.PartialPick(ctx, p.PartialPickArgs)
 	}))
 
 	// M16 — AI conflict resolution helpers
@@ -345,6 +368,28 @@ func registerHandlers(s *rpc.Server) {
 			return nil, err
 		}
 		return r.RestoreConflict(ctx, p.RestoreConflictArgs)
+	}))
+
+	s.Register("git.stash", wrap1(func(ctx context.Context, p struct {
+		Repo string `json:"repo"`
+		git.StashArgs
+	}) (any, error) {
+		r, err := git.Open(ctx, p.Repo)
+		if err != nil {
+			return nil, err
+		}
+		return r.Stash(ctx, p.StashArgs)
+	}))
+
+	s.Register("git.stashPop", wrap1(func(ctx context.Context, p struct {
+		Repo string `json:"repo"`
+		git.StashPopArgs
+	}) (any, error) {
+		r, err := git.Open(ctx, p.Repo)
+		if err != nil {
+			return nil, err
+		}
+		return r.StashPop(ctx, p.StashPopArgs)
 	}))
 
 	s.Register("git.diffTexts", wrap1(func(ctx context.Context, p struct {
