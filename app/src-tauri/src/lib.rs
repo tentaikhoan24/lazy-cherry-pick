@@ -190,6 +190,7 @@ fn git_log_read(app: tauri::AppHandle) -> Result<Vec<serde_json::Value>, String>
             // Format: "<type> <ts> <rest>"
             // For cmd: rest = "<ms>|<branch>|git <args>"
             // For info: rest = "<label>"
+            // For ai:   rest = "<json object, without ts/type>"
             let mut parts = line.splitn(3, ' ');
             let kind = parts.next()?;
             let ts: u64 = parts.next()?.parse().ok()?;
@@ -204,6 +205,11 @@ fn git_log_read(app: tauri::AppHandle) -> Result<Vec<serde_json::Value>, String>
                     (None, None, rest.to_string())
                 };
                 Some(serde_json::json!({ "ts": ts, "type": "cmd", "cmd": cmd, "branch": branch, "ms": ms }))
+            } else if kind == "ai" {
+                let mut obj: serde_json::Map<String, Value> = serde_json::from_str(rest).ok()?;
+                obj.insert("ts".to_string(), serde_json::json!(ts));
+                obj.insert("type".to_string(), serde_json::json!("ai"));
+                Some(Value::Object(obj))
             } else {
                 Some(serde_json::json!({ "ts": ts, "type": kind, "cmd": rest }))
             }
@@ -222,6 +228,84 @@ fn git_log_clear(app: tauri::AppHandle) -> Result<(), String> {
         fs::write(&path, "").map_err(|e| format!("clear git log failed: {e}"))?;
     }
     Ok(())
+}
+
+fn unix_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn append_log_line(app: &tauri::AppHandle, line: &str) {
+    if let Ok(path) = git_log_file(app) {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(f, "{line}");
+        }
+    }
+}
+
+/// Short display name for an AI CLI executable, e.g. "C:\...\claude.cmd" -> "claude".
+fn ai_command_name(command: &str) -> String {
+    std::path::Path::new(command)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| command.to_string())
+}
+
+/// Replaces the raw prompt text inside `args` (arg-mode prompt delivery) with a
+/// `<prompt: N chars>` placeholder so the log doesn't balloon with file contents.
+fn sanitize_ai_args(args: &[String], prompt: &str, prompt_via: &str) -> Vec<String> {
+    if prompt_via == "arg" && !prompt.is_empty() {
+        args.iter()
+            .map(|a| {
+                if a == prompt {
+                    format!("<prompt: {} chars>", prompt.chars().count())
+                } else {
+                    a.clone()
+                }
+            })
+            .collect()
+    } else {
+        args.to_vec()
+    }
+}
+
+/// Records one AI-CLI invocation in the same `git.log` file / `git-log` event
+/// stream as git commands, so `GitConsole.svelte` shows both side by side.
+fn log_ai_result(
+    app: &tauri::AppHandle,
+    command: &str,
+    args: &[String],
+    prompt_via: &str,
+    prompt_chars: usize,
+    success: bool,
+    cost_usd: f64,
+    duration_ms: u64,
+    error: &str,
+) {
+    let ts = unix_ts();
+    let error_trunc: String = error.chars().take(300).collect();
+    let mut payload = serde_json::json!({
+        "command": command,
+        "args": args,
+        "promptVia": prompt_via,
+        "promptChars": prompt_chars,
+        "success": success,
+        "costUsd": cost_usd,
+        "durationMs": duration_ms,
+        "error": error_trunc,
+    });
+    append_log_line(app, &format!("ai {ts} {payload}"));
+    if let Value::Object(ref mut m) = payload {
+        m.insert("ts".to_string(), serde_json::json!(ts));
+        m.insert("type".to_string(), serde_json::json!("ai"));
+    }
+    let _ = app.emit("git-log", payload);
 }
 
 // ── app settings ─────────────────────────────────────────────────────────────
@@ -256,6 +340,29 @@ struct AppSettings {
     external_merge_args: String,
     #[serde(rename = "checkForUpdatesOnStartup", default = "default_true")]
     check_for_updates_on_startup: bool,
+    /// M16/M16b — AI conflict resolution via a headless AI CLI agent
+    /// (Claude Code / Gemini / Codex / Aider / custom). The engine is generic;
+    /// `ai_provider` only remembers which preset the UI last applied.
+    #[serde(rename = "aiEnabled", default)]
+    ai_enabled: bool,
+    #[serde(rename = "aiProvider", default = "default_ai_provider")]
+    ai_provider: String,
+    #[serde(rename = "aiCommand", default)]
+    ai_command: String,
+    #[serde(rename = "aiArgs", default = "default_ai_args")]
+    ai_args: String,
+    /// "" = the tool's own default model; else a provider-specific alias/id.
+    #[serde(rename = "aiModel", default)]
+    ai_model: String,
+    /// "stdin" (prompt fed via STDIN) | "arg" (prompt already embedded in args).
+    #[serde(rename = "aiPromptVia", default = "default_prompt_via")]
+    ai_prompt_via: String,
+    /// "claude-json" (parse Claude's JSON envelope for success/cost) | "none"
+    /// (use the process exit code only).
+    #[serde(rename = "aiOutputFormat", default = "default_output_format")]
+    ai_output_format: String,
+    #[serde(rename = "aiTimeoutSecs", default = "default_ai_timeout")]
+    ai_timeout_secs: u32,
     /// M14 — per-repo forge connections, keyed by repo path.
     /// Token itself is NOT here — it lives in the OS keychain. Only metadata
     /// (kind + baseURL + username + host) so we can locate the token.
@@ -277,6 +384,13 @@ struct ForgeConnection {
 }
 
 fn default_theme() -> String { "dark".to_string() }
+fn default_ai_provider() -> String { "claude".to_string() }
+fn default_prompt_via() -> String { "stdin".to_string() }
+fn default_output_format() -> String { "claude-json".to_string() }
+fn default_ai_timeout() -> u32 { 120 }
+fn default_ai_args() -> String {
+    "-p --output-format json --allowedTools \"Read,Edit,Write,Glob,Grep\" --disallowedTools \"Bash\" --permission-mode acceptEdits --model {model}".to_string()
+}
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -293,6 +407,14 @@ impl Default for AppSettings {
             external_merge_path: String::new(),
             external_merge_args: String::new(),
             check_for_updates_on_startup: true,
+            ai_enabled: false,
+            ai_provider: default_ai_provider(),
+            ai_command: String::new(),
+            ai_args: default_ai_args(),
+            ai_model: String::new(),
+            ai_prompt_via: default_prompt_via(),
+            ai_output_format: default_output_format(),
+            ai_timeout_secs: default_ai_timeout(),
             forge_connections: HashMap::new(),
         }
     }
@@ -377,6 +499,250 @@ fn detect_external_tools() -> Vec<serde_json::Value> {
         found.push(serde_json::json!({ "name": "VSCode", "path": vscode_path }));
     }
     found
+}
+
+// ── M16/M16b: AI conflict resolution via a headless AI CLI agent ─────────────
+
+#[derive(Debug, Serialize)]
+struct DetectedAi {
+    found: bool,
+    path: String,
+    version: String,
+}
+
+/// Locate an AI CLI executable. `command` may be a bare name ("claude",
+/// "gemini", "codex", "aider") or an explicit path. For a bare name we check the
+/// npm-global `%APPDATA%\npm\<name>.cmd` shim first, then PATH (`where`). Returns
+/// the resolved path + its `--version` output.
+#[tauri::command]
+fn detect_ai_tool(command: String) -> DetectedAi {
+    let command = command.trim().to_string();
+    let mut candidates: Vec<String> = Vec::new();
+
+    let looks_like_path = command.contains('\\') || command.contains('/');
+    if looks_like_path {
+        candidates.push(command.clone());
+    } else {
+        let name = if command.is_empty() { "claude".to_string() } else { command.clone() };
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            candidates.push(format!(r"{appdata}\npm\{name}.cmd"));
+        }
+        if let Ok(out) = std::process::Command::new("where").arg(&name).output() {
+            if out.status.success() {
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    let p = line.trim();
+                    if !p.is_empty()
+                        && (p.ends_with(".cmd") || p.ends_with(".exe") || p.ends_with(".bat"))
+                    {
+                        candidates.push(p.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    for path in candidates {
+        if !std::path::Path::new(&path).exists() {
+            continue;
+        }
+        let lower = path.to_lowercase();
+        let version = if lower.ends_with(".cmd") || lower.ends_with(".bat") {
+            std::process::Command::new("cmd").args(["/C", &path, "--version"]).output()
+        } else {
+            std::process::Command::new(&path).arg("--version").output()
+        }
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+        return DetectedAi { found: true, path, version };
+    }
+    DetectedAi { found: false, path: String::new(), version: String::new() }
+}
+
+#[derive(Debug, Serialize)]
+struct AiResult {
+    success: bool,
+    #[serde(rename = "isError")]
+    is_error: bool,
+    #[serde(rename = "resultText")]
+    result_text: String,
+    error: String,
+    #[serde(rename = "costUsd")]
+    cost_usd: f64,
+    #[serde(rename = "durationMs")]
+    duration_ms: u64,
+}
+
+/// Run a headless AI CLI agent to resolve conflicts in-place. The agent is
+/// expected to edit the conflict files on disk; the caller reads them back
+/// afterwards — we never parse merged content out of stdout. `args` is fully
+/// rendered by the caller. When `prompt_via == "stdin"` the prompt is fed via
+/// STDIN (avoids cmd.exe quoting); otherwise the caller already embedded it in
+/// `args`. `output_format == "claude-json"` parses Claude Code's JSON envelope
+/// for success/cost; any other value falls back to the process exit code.
+///
+/// A `.cmd`/`.bat` command is run through `cmd /C` (npm shims); anything else is
+/// spawned directly (cleaner argv quoting — no cmd.exe layer).
+///
+/// Every invocation is recorded into `git.log` / the `git-log` event stream
+/// (same as `[GIT_CMD]`/`[GIT_INFO]`) via `log_ai_result`, regardless of outcome.
+#[tauri::command]
+async fn run_ai_resolve(
+    app: tauri::AppHandle,
+    repo_path: String,
+    command: String,
+    args: Vec<String>,
+    prompt: String,
+    prompt_via: String,
+    output_format: String,
+    timeout_secs: u64,
+) -> Result<AiResult, String> {
+    let log_command = ai_command_name(&command);
+    let log_args = sanitize_ai_args(&args, &prompt, &prompt_via);
+    let log_prompt_chars = prompt.chars().count();
+    let wall_start = std::time::Instant::now();
+
+    let outcome = run_ai_resolve_inner(
+        repo_path,
+        command,
+        args,
+        prompt,
+        prompt_via.clone(),
+        output_format,
+        timeout_secs,
+    )
+    .await;
+
+    let (success, cost_usd, duration_ms, error) = match &outcome {
+        Ok(r) => (r.success, r.cost_usd, r.duration_ms, r.error.clone()),
+        Err(e) => (false, 0.0, wall_start.elapsed().as_millis() as u64, e.clone()),
+    };
+    log_ai_result(
+        &app,
+        &log_command,
+        &log_args,
+        &prompt_via,
+        log_prompt_chars,
+        success,
+        cost_usd,
+        duration_ms,
+        &error,
+    );
+
+    outcome
+}
+
+async fn run_ai_resolve_inner(
+    repo_path: String,
+    command: String,
+    args: Vec<String>,
+    prompt: String,
+    prompt_via: String,
+    output_format: String,
+    timeout_secs: u64,
+) -> Result<AiResult, String> {
+    use tokio::io::AsyncWriteExt;
+
+    if command.trim().is_empty() {
+        return Err("no AI command configured (set the executable path in Settings)".to_string());
+    }
+
+    let lower = command.to_lowercase();
+    let use_cmd = lower.ends_with(".cmd") || lower.ends_with(".bat");
+
+    let mut cmd = if use_cmd {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C").arg(&command).args(&args);
+        c
+    } else {
+        let mut c = tokio::process::Command::new(&command);
+        c.args(&args);
+        c
+    };
+
+    let mut child = cmd
+        .current_dir(&repo_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("failed to launch AI tool '{command}': {e}"))?;
+
+    // Feed the prompt via stdin when requested, then close the pipe (EOF) so the
+    // tool starts. When the prompt is in argv, still close stdin so the tool
+    // doesn't block waiting for input it will never get.
+    if let Some(mut stdin) = child.stdin.take() {
+        if prompt_via == "stdin" {
+            stdin
+                .write_all(prompt.as_bytes())
+                .await
+                .map_err(|e| format!("failed to write prompt to stdin: {e}"))?;
+        }
+        // dropping `stdin` here closes the pipe
+    }
+
+    let start = std::time::Instant::now();
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        child.wait_with_output(),
+    )
+    .await
+    {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(format!("AI tool execution failed: {e}")),
+        Err(_) => return Err(format!("AI tool timed out after {timeout_secs}s")),
+    };
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if output_format == "claude-json" {
+        if stdout.trim().is_empty() {
+            let detail = if stderr.trim().is_empty() {
+                "no output (is the AI CLI logged in? run it once to authenticate)".to_string()
+            } else {
+                stderr.trim().to_string()
+            };
+            return Err(format!("AI tool produced no result: {detail}"));
+        }
+        let parsed: Value = serde_json::from_str(stdout.trim()).map_err(|e| {
+            let preview: String = stdout.chars().take(500).collect();
+            format!("cannot parse AI JSON output: {e}; raw: {preview}")
+        })?;
+        let is_error = parsed.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+        let result_text = parsed.get("result").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let cost_usd = parsed.get("total_cost_usd").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        return Ok(AiResult {
+            success: !is_error,
+            is_error,
+            error: if is_error { result_text.clone() } else { String::new() },
+            result_text,
+            cost_usd,
+            duration_ms,
+        });
+    }
+
+    // Generic mode: success is the process exit code. The merged content is read
+    // from disk by the caller; stdout is only kept for diagnostics.
+    let ok = output.status.success();
+    let result_text: String = stdout.chars().take(2000).collect();
+    let err_text = if ok {
+        String::new()
+    } else {
+        let detail = if !stderr.trim().is_empty() { stderr.trim().to_string() } else { result_text.clone() };
+        format!("AI tool exited with status {}: {}", output.status, detail)
+    };
+    Ok(AiResult {
+        success: ok,
+        is_error: !ok,
+        error: err_text,
+        result_text,
+        cost_usd: 0.0,
+        duration_ms,
+    })
 }
 
 // ── recent repos ─────────────────────────────────────────────────────────────
@@ -590,6 +956,8 @@ pub fn run() {
             launch_detached,
             launch_and_wait,
             detect_external_tools,
+            detect_ai_tool,
+            run_ai_resolve,
             forge_test_connection,
             forge_save_connection,
             forge_delete_connection,

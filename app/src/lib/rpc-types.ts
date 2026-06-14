@@ -217,8 +217,40 @@ export interface AppSettings {
   externalMergePath: string;
   externalMergeArgs: string;
   checkForUpdatesOnStartup: boolean;
+  /** M16/M16b — AI conflict resolution via a headless AI CLI agent. */
+  aiEnabled: boolean;
+  /** Preset id the UI last applied: "claude" | "gemini" | "codex" | "aider" | "custom". */
+  aiProvider: string;
+  /** Executable name or full path (e.g. "claude", "gemini", "...\\codex.cmd"). */
+  aiCommand: string;
+  /** Args template; `{model}` and (when promptVia="arg") `{prompt}` placeholders. */
+  aiArgs: string;
+  /** "" = the tool's default model; else a provider-specific alias/id. */
+  aiModel: string;
+  /** "stdin" = prompt fed via STDIN; "arg" = prompt embedded in args via {prompt}. */
+  aiPromptVia: "stdin" | "arg";
+  /** "claude-json" = parse Claude's JSON envelope; "none" = exit-code only. */
+  aiOutputFormat: "claude-json" | "none";
+  aiTimeoutSecs: number;
   /** Per-repo forge connection metadata. Tokens are NOT here — they live in the OS keychain. */
   forgeConnections?: Record<string, ForgeConnection>;
+}
+
+/** Result of `detect_ai_tool` Tauri command. */
+export interface DetectedAi {
+  found: boolean;
+  path: string;
+  version: string;
+}
+
+/** Result of `run_ai_resolve` Tauri command. */
+export interface AiResult {
+  success: boolean;
+  isError: boolean;
+  resultText: string;
+  error: string;
+  costUsd: number;
+  durationMs: number;
 }
 
 export interface ExtractDiffFilesResult {

@@ -335,6 +335,28 @@ func registerHandlers(s *rpc.Server) {
 		return r.ContinueCherry(ctx, struct{}{})
 	}))
 
+	// M16 — AI conflict resolution helpers
+	s.Register("git.restoreConflict", wrap1(func(ctx context.Context, p struct {
+		Repo string `json:"repo"`
+		git.RestoreConflictArgs
+	}) (any, error) {
+		r, err := git.Open(ctx, p.Repo)
+		if err != nil {
+			return nil, err
+		}
+		return r.RestoreConflict(ctx, p.RestoreConflictArgs)
+	}))
+
+	s.Register("git.diffTexts", wrap1(func(ctx context.Context, p struct {
+		Repo string `json:"repo"`
+		git.DiffTextsArgs
+	}) (any, error) {
+		// repo is unused (diff --no-index), but accepted for call-shape consistency.
+		_ = p.Repo
+		var r git.Repo
+		return r.DiffTexts(ctx, p.DiffTextsArgs)
+	}))
+
 	// git.cherry — detect already-applied commits (patch equivalence check)
 	s.Register("git.cherry", wrap1(func(ctx context.Context, p struct {
 		Repo string `json:"repo"`

@@ -14,9 +14,20 @@
     onabort: () => void;
     onviewfile?: (file: string) => void;
     onviewdiff?: (file: string) => void;
+    // M16 — AI conflict resolution
+    aiEnabled?: boolean;
+    aiBusy?: boolean;
+    aiResolvedSet?: Set<string>;
+    onairesolveall?: () => void;
+    onaireview?: (file: string) => void;
+    onaiaccept?: (file: string) => void;
+    onaidiscard?: (file: string) => void;
   }
 
-  let { files, conflictSha, queue, dryRunMap, remainingCommitFiles, busy, resolvedSet, onresolve, oncontinue, onabort, onviewfile, onviewdiff }: Props = $props();
+  let { files, conflictSha, queue, dryRunMap, remainingCommitFiles, busy, resolvedSet, onresolve, oncontinue, onabort, onviewfile, onviewdiff, aiEnabled = false, aiBusy = false, aiResolvedSet = new Set(), onairesolveall, onaireview, onaiaccept, onaidiscard }: Props = $props();
+
+  // Files still needing attention (not staged, not AI-pending) — used to gate the AI button.
+  const aiResolvableCount = $derived(files.filter(f => !resolvedSet.has(f.path) && !aiResolvedSet.has(f.path)).length);
 
   const resolvedCount = $derived([...resolvedSet].filter(p => files.some(f => f.path === p)).length);
   const allResolved = $derived(files.length > 0 && resolvedCount === files.length);
@@ -47,6 +58,16 @@
     <span class="icon">⚠</span>
     <span class="title">Cherry-pick paused — conflicts</span>
     <span class="hint">Ours = target branch &nbsp;·&nbsp; Theirs = cherry-picked commit</span>
+    {#if aiEnabled}
+      <button
+        class="ai-btn"
+        onclick={onairesolveall}
+        disabled={aiBusy || busy || aiResolvableCount === 0}
+        title={aiResolvableCount === 0 ? "Nothing left for AI to resolve" : "Let the AI CLI propose a merge for the remaining conflicts"}
+      >
+        {aiBusy ? "🤖 Resolving…" : "🤖 AI resolve all"}
+      </button>
+    {/if}
   </div>
 
   <div class="commit-sections">
@@ -64,15 +85,20 @@
 
       {#each files as f}
         {@const resolved = resolvedSet.has(f.path)}
-        <div class="file-row" class:resolved>
+        {@const aiPending = !resolved && aiResolvedSet.has(f.path)}
+        <div class="file-row" class:resolved class:ai-pending={aiPending}>
           <span class="file-tree-line"></span>
-          <span class="status-label" class:resolved-label={resolved}>{statusLabel[f.status] ?? f.status}</span>
+          <span class="status-label" class:resolved-label={resolved} class:ai-label={aiPending}>
+            {aiPending ? "AI" : (statusLabel[f.status] ?? f.status)}
+          </span>
           {#if resolved}
             {#if onviewdiff}
               <button class="file-path-btn file-path-btn-resolved" title="View staged diff: {f.path}" onclick={() => onviewdiff!(f.path)}>{f.path}</button>
             {:else}
               <span class="file-path">{f.path}</span>
             {/if}
+          {:else if aiPending && onaireview}
+            <button class="file-path-btn" title="Review AI resolution: {f.path}" onclick={() => onaireview!(f.path)}>{f.path}</button>
           {:else if onviewfile}
             <button class="file-path-btn" title="Open merge editor: {f.path}" onclick={() => onviewfile!(f.path)}>{f.path}</button>
           {:else}
@@ -80,6 +106,10 @@
           {/if}
           {#if resolved}
             <span class="resolved-badge">✓ resolved</span>
+          {:else if aiPending}
+            <button class="resolve-btn review" onclick={() => onaireview?.(f.path)}  disabled={busy}>Review</button>
+            <button class="resolve-btn accept" onclick={() => onaiaccept?.(f.path)}  disabled={busy}>Accept</button>
+            <button class="resolve-btn discard" onclick={() => onaidiscard?.(f.path)} disabled={busy}>Discard</button>
           {:else}
             <button class="resolve-btn ours"   onclick={() => onresolve(f.path, "ours")}   disabled={busy}>Keep Ours</button>
             <button class="resolve-btn theirs" onclick={() => onresolve(f.path, "theirs")} disabled={busy}>Use Theirs</button>
@@ -328,6 +358,45 @@
     color: #4a7ef5;
   }
   .resolve-btn.theirs:not(:disabled):hover { background: rgba(74,126,245,0.2); }
+
+  /* ── AI resolution ── */
+  .ai-btn {
+    flex-shrink: 0;
+    margin-left: 0.5rem;
+    padding: 0.22rem 0.6rem;
+    border-radius: 5px;
+    border: 1px solid #a974ff;
+    background: rgba(169, 116, 255, 0.12);
+    color: #c8a6ff;
+    font-size: 0.74rem;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .ai-btn:not(:disabled):hover { background: rgba(169, 116, 255, 0.22); }
+  .ai-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .file-row.ai-pending { background: rgba(169, 116, 255, 0.06); }
+  .ai-label { color: #c8a6ff !important; background: rgba(169, 116, 255, 0.15) !important; }
+
+  .resolve-btn.review {
+    border-color: rgba(169, 116, 255, 0.5);
+    background: rgba(169, 116, 255, 0.1);
+    color: #c8a6ff;
+  }
+  .resolve-btn.review:not(:disabled):hover { background: rgba(169, 116, 255, 0.2); }
+  .resolve-btn.accept {
+    border-color: rgba(102, 187, 106, 0.6);
+    background: rgba(102, 187, 106, 0.12);
+    color: #66bb6a;
+  }
+  .resolve-btn.accept:not(:disabled):hover { background: rgba(102, 187, 106, 0.22); }
+  .resolve-btn.discard {
+    border-color: rgba(239, 83, 80, 0.5);
+    background: transparent;
+    color: #ef5350;
+  }
+  .resolve-btn.discard:not(:disabled):hover { background: rgba(239, 83, 80, 0.12); }
 
   /* ── Footer ── */
   .resolver-footer {

@@ -67,6 +67,25 @@ func (r *Repo) ResolveConflict(ctx context.Context, args ResolveConflictArgs) (a
 	return map[string]any{"resolved": true}, nil
 }
 
+// ── restore conflict markers ──────────────────────────────────────────────────
+
+type RestoreConflictArgs struct {
+	File string `json:"file"`
+}
+
+// RestoreConflict re-creates the conflict markers for a file by running
+// `git checkout -m -- <file>`, rebuilding the merged working-tree content from
+// the index stages (:1 base, :2 ours, :3 theirs). Used to undo an AI-proposed
+// resolution that the user discards. Works only while the file is still
+// unmerged in the index — which holds because the AI resolver is blocked from
+// running `git add` (Bash disallowed).
+func (r *Repo) RestoreConflict(ctx context.Context, args RestoreConflictArgs) (any, error) {
+	if _, err := run(ctx, r.Path, "checkout", "-m", "--", args.File); err != nil {
+		return nil, err
+	}
+	return map[string]any{"restored": true}, nil
+}
+
 // ── continue cherry-pick ──────────────────────────────────────────────────────
 
 type ContinueCherryResult struct {

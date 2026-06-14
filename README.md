@@ -133,9 +133,22 @@ Integration tests use real temp git repos (no mocks).
    - On conflict: **ConflictResolver** panel appears
      - **Keep Ours / Use Theirs** — one-click resolution per file
      - Click filename → opens the **3-pane merge editor** (TortoiseGit style) with inline per-block action buttons, cross-pane combine, and keyboard navigation
+     - **🤖 AI resolve all** (if enabled in Settings) — shells out to your installed headless AI CLI (Claude Code, etc.) to merge every conflicting file, then lets you **Review** each result (3-way view identical to the manual editor, or your external merge tool), **Accept & stage** or **Discard** — see [AI conflict resolution](#ai-conflict-resolution-desktop--ai-cli) below
      - **Continue →** after all files resolved; **Abort** to cancel
    - Result shown via Toast (success / skipped) or the conflict banner
-7. **Settings** (gear icon) — theme, max commits, EOL markers, external diff/merge tools (TortoiseGit/Beyond Compare/WinMerge/VS Code), auto-updater, and **Connect** GitHub/GitLab/Bitbucket for one-click PR/MR creation after applying
+7. **Settings** (gear icon) — theme, max commits, EOL markers, **AI conflict resolution** (headless AI CLI), external diff/merge tools (TortoiseGit/Beyond Compare/WinMerge/VS Code), auto-updater, and **Connect** GitHub/GitLab/Bitbucket for one-click PR/MR creation after applying
+
+## AI conflict resolution (desktop → AI CLI)
+
+The desktop app can shell out to your **installed headless AI CLI** to suggest a merge for cherry-pick conflicts. This is the *reverse* direction from the MCP server below: here the **app drives the AI**, not the other way around.
+
+- **One button, all files**: in the ConflictResolver, **🤖 AI resolve all** runs the configured CLI once over every conflicting file so the model sees the whole picture.
+- **Stability**: the app never parses the model's stdout for merged content — the AI agent (with Edit/Write) writes the merged file straight to disk and the app re-reads it. stdout JSON is used only for success/cost/error.
+- **Review before stage (human-in-the-loop)**: each AI-resolved file shows **Review** → a 3-way view *identical to the manual merge editor* (Theirs / Ours / merged result), or your external merge tool if configured → **Accept & stage** or **Discard** (restores the conflict markers via `git checkout -m`).
+- **Safety**: the CLI runs with shell/git/network tools disabled, so it can't commit/push and the index stays unmerged (Discard always works); files are verified marker-free before staging.
+- **Provider-agnostic**: Settings → **AI Conflict Resolution** ships a verified **Claude Code** preset (uses your existing Claude login — no separate API key) plus editable presets for other CLIs (Gemini/Codex/Aider/Custom). Every AI invocation is also logged in the **Git Console** (🤖 entries, with cost + duration).
+
+See [CLAUDE.md](./CLAUDE.md) (M16 series) for the design rationale and the exact CLI flags.
 
 ## MCP server / AI integration
 
@@ -214,7 +227,8 @@ See [docs/IPC.md](./docs/IPC.md) for all NDJSON method signatures, or [docs/MCP.
 - ✅ **M10** Keyboard nav, drag-drop reorder, undo (Ctrl+Z), Toast notifications, already-applied detection & auto-skip
 - ✅ **M13** Multi-remote `Apply & Push → <remote>`, Copy SHA / Open commit in browser, forge URL parser
 - ✅ **M14** PR/MR creation for GitHub, GitLab, and Bitbucket Cloud — OS-keychain tokens, PR status bar with hover preview, "Apply & Push & Create PR" flow
-- ✅ **M15a** MCP server — sidecar doubles as a 13-tool MCP server (`--mcp`) for AI clients, with an AI-driven conflict-resolution loop
+- ✅ **M15a** MCP server — sidecar doubles as a 22-tool MCP server (`--mcp`) for AI clients, with an AI-driven conflict-resolution loop
+- ✅ **M16** AI conflict resolution (desktop → headless AI CLI) — "🤖 AI resolve all", review-before-stage with a 3-way view matching the manual editor (or external merge tool), provider-agnostic presets (Claude Code verified), AI calls logged in the Git Console
 - 🔜 **M15b+** — forge tools over MCP, MCP Sampling, further polish
 
 See [CLAUDE.md](./CLAUDE.md) for the full per-milestone changelog.

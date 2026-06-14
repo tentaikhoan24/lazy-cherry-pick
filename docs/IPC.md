@@ -469,6 +469,26 @@ Reads the current working-tree content of a file (not from git history). Used by
 
 ---
 
+### `git.restoreConflict` (M16)
+
+Params: `{ repo: string; file: string }`
+
+Result: `{ restored: boolean }`
+
+Re-creates conflict markers for a file via `git checkout -m -- <file>`, rebuilding the merged working-tree content from the index stages (`:1` base, `:2` ours, `:3` theirs). Used to undo an AI-proposed resolution the user discards. Works only while the file is still unmerged in the index.
+
+---
+
+### `git.diffTexts` (M16)
+
+Params: `{ leftText: string; rightText: string }` (no `repo` — operates on temp files)
+
+Result: `{ sha: ""; file: ""; diff: string }` (same `FileDiffResult` shape; raw unified diff)
+
+Produces a unified diff between two arbitrary text blobs by writing them to temp files and running `git diff --no-index --unified=99999`. Used by the AI-review modal to show "[conflict original] vs [AI resolved]" without either side being a git ref. `git diff --no-index` exits 1 when the files differ — the sidecar treats that as "differences found" (normal) and returns the captured diff; exit 0 yields an empty diff.
+
+---
+
 ### `git.writeAndStageFile`
 
 Params: `{ repo: string; path: string; content: string }`

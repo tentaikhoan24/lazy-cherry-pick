@@ -155,6 +155,13 @@ export const rpc = {
 
     cherry: (repo: string, source: string, target: string, maxCount = 0) =>
       call<string[]>("git.cherry", { repo, source, target, maxCount }),
+
+    // M16 — AI conflict resolution helpers
+    restoreConflict: (repo: string, file: string) =>
+      call<{ restored: boolean }>("git.restoreConflict", { repo, file }),
+
+    diffTexts: (leftText: string, rightText: string) =>
+      call<FileDiffResult>("git.diffTexts", { leftText, rightText }),
   },
 
   // ── M14 — Forge integration (GitHub/GitLab PR creation) ──────────────────

@@ -3,19 +3,7 @@
   import { rpc } from "$lib/rpc";
   import { emit } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-
-  // ── Types ──────────────────────────────────────────────────────
-  interface ContextPart  { kind: "context";  lines: string[] }
-  interface ConflictPart { kind: "conflict"; ours: string[]; theirs: string[] }
-  type Part = ContextPart | ConflictPart;
-
-  interface RenderLine {
-    text: string | null;
-    kind: "context" | "ours" | "theirs" | "filler" | "conflict-header";
-    conflictIdx: number;
-    lineNum: number | null;
-  }
-  interface Rendered { left: RenderLine[]; right: RenderLine[]; conflictStarts: number[] }
+  import { parseConflict, buildRenderLines, normalizeConflictText, type Part, type ConflictPart } from "$lib/conflict-parse";
 
   // ── Drag-select state (independent per pane) ──────────────────
   interface PaneSel { ci: number; startIdx: number; endIdx: number }
@@ -100,63 +88,8 @@
   const totalConflicts = $derived(conflicts.length);
   const hasUnresolved  = $derived(provisionalChoices.size < totalConflicts);
 
-  // ── Build render lines with line numbers ───────────────────────
-  function buildRenderLines(parts: Part[]): Rendered {
-    const left: RenderLine[] = [];
-    const right: RenderLine[] = [];
-    const conflictStarts: number[] = [];
-    let ci = 0, lNum = 1, rNum = 1;
-
-    for (const part of parts) {
-      if (part.kind === "context") {
-        for (const ln of part.lines) {
-          left.push({ text: ln, kind: "context", conflictIdx: -1, lineNum: lNum++ });
-          right.push({ text: ln, kind: "context", conflictIdx: -1, lineNum: rNum++ });
-        }
-      } else {
-        conflictStarts.push(left.length);
-        left.push({ text: null, kind: "conflict-header", conflictIdx: ci, lineNum: null });
-        right.push({ text: null, kind: "conflict-header", conflictIdx: ci, lineNum: null });
-        const max = Math.max(part.theirs.length, part.ours.length);
-        for (let i = 0; i < max; i++) {
-          left.push(i < part.theirs.length
-            ? { text: part.theirs[i], kind: "theirs", conflictIdx: ci, lineNum: lNum++ }
-            : { text: null, kind: "filler", conflictIdx: ci, lineNum: null });
-          right.push(i < part.ours.length
-            ? { text: part.ours[i], kind: "ours", conflictIdx: ci, lineNum: rNum++ }
-            : { text: null, kind: "filler", conflictIdx: ci, lineNum: null });
-        }
-        ci++;
-      }
-    }
-    return { left, right, conflictStarts };
-  }
-
+  // ── Render lines (logic shared via $lib/conflict-parse) ────────
   const rendered = $derived(buildRenderLines(parts));
-
-  // ── Parse conflict markers ─────────────────────────────────────
-  function parse(raw: string): { parts: Part[]; initial: string } {
-    const norm = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    const lines = norm.split("\n");
-    const result: Part[] = [];
-    let st: "ctx" | "ours" | "theirs" = "ctx";
-    let ctx: string[] = [], ours: string[] = [], theirs: string[] = [];
-    for (const ln of lines) {
-      if (st === "ctx" && ln.startsWith("<<<<<<<")) {
-        if (ctx.length) result.push({ kind: "context", lines: ctx });
-        ctx = []; ours = []; st = "ours";
-      } else if (st === "ours" && ln.startsWith("=======")) {
-        theirs = []; st = "theirs";
-      } else if (st === "theirs" && ln.startsWith(">>>>>>>")) {
-        result.push({ kind: "conflict", ours, theirs });
-        st = "ctx"; ctx = [];
-      } else if (st === "ours") { ours.push(ln); }
-      else if (st === "theirs") { theirs.push(ln); }
-      else { ctx.push(ln); }
-    }
-    if (ctx.length) result.push({ kind: "context", lines: ctx });
-    return { parts: result, initial: norm };
-  }
 
   // ── Provisional set — soft resolution, always changeable ──────
   function provisionalSet(ci: number, lines: string[]) {
@@ -350,9 +283,8 @@
       // Only sync back if user actually typed something in raw mode
       if (rawEdited) {
         const edited = getRawFinalText();
-        const parsed = parse(edited);
         mergedText = edited;
-        parts = parsed.parts;
+        parts = parseConflict(edited);
         provisionalChoices = new Map();
       }
       showRaw = false;
@@ -401,9 +333,8 @@
       try { const s = await rpc.settings.load(); document.body.classList.toggle("light", s.theme === "light"); } catch { /* ignore */ }
       try {
         const r = await rpc.git.fileContent(repo, file);
-        const parsed = parse(r.content);
-        parts = parsed.parts;
-        mergedText = parsed.initial;
+        parts = parseConflict(r.content);
+        mergedText = normalizeConflictText(r.content);
       } catch (e) { error = String(e); }
       loading = false;
       setTimeout(() => scrollToConflict(0), 120);

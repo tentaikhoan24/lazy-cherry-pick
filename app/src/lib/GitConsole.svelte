@@ -12,10 +12,19 @@
 
   interface LogEntry {
     ts: number;
-    type: "cmd" | "info";
+    type: "cmd" | "info" | "ai";
     cmd: string;
     branch?: string | null;
     ms?: number | null;
+    // "ai" entries only — one headless AI CLI invocation (M16/M16b)
+    command?: string;
+    args?: string[];
+    promptVia?: string;
+    promptChars?: number;
+    success?: boolean;
+    costUsd?: number;
+    durationMs?: number;
+    error?: string;
   }
 
   let entries = $state<LogEntry[]>([]);
@@ -86,7 +95,7 @@
       <line x1="12" y1="19" x2="20" y2="19"/>
     </svg>
     <span class="console-title">Git Console</span>
-    <span class="entry-count">{entries.length} command{entries.length === 1 ? "" : "s"}</span>
+    <span class="entry-count">{entries.length} entr{entries.length === 1 ? "y" : "ies"}</span>
     <div class="console-actions">
       <button class="hdr-btn" onclick={clear} title="Clear log">Clear</button>
       <button class="hdr-btn close" onclick={onclose} title="Close console">✕</button>
@@ -103,6 +112,29 @@
           <span class="log-info-label">{fmtMethod(e.cmd)}</span>
           <span class="log-info-ts">{formatTime(e.ts)}</span>
         </div>
+      {:else if e.type === "ai"}
+        <div class="log-ai" class:log-ai-error={!e.success}>
+          <span class="log-ts">{formatTime(e.ts)}</span>
+          <span class="ai-icon">🤖</span>
+          <span class="ai-cmd" title={[e.command, ...(e.args ?? [])].join(" ")}>
+            <span class="ai-name">{e.command}</span><span class="ai-args">{" "}{(e.args ?? []).join(" ")}</span>
+          </span>
+          <span class="ai-prompt">prompt {e.promptChars}c via {e.promptVia}</span>
+          {#if e.success}
+            <span class="ai-status ok">✓</span>
+            {#if (e.costUsd ?? 0) > 0}
+              <span class="ai-cost">${e.costUsd?.toFixed(4)}</span>
+            {/if}
+          {:else}
+            <span class="ai-status err" title={e.error}>✗</span>
+          {/if}
+          {#if e.durationMs != null}
+            <span class="log-ms">{e.durationMs}ms</span>
+          {/if}
+        </div>
+        {#if !e.success && e.error}
+          <div class="log-ai-error-detail">{e.error}</div>
+        {/if}
       {:else}
         {@const { sub, rest } = splitGit(e.cmd)}
         <div class="log-line">
@@ -243,5 +275,59 @@
     font-family: ui-monospace, monospace;
     min-width: 3rem;
     text-align: right;
+  }
+
+  /* ── AI CLI invocation line (M16/M16b) ── */
+  .log-ai {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.1rem 0.75rem 0.1rem 1.5rem;
+    font-size: 0.76rem;
+    line-height: 1.5;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  .log-ai:hover { background: rgba(255,255,255,0.03); }
+  .log-ai.log-ai-error { background: rgba(239,83,80,0.07); }
+
+  .ai-icon { flex-shrink: 0; font-size: 0.8rem; }
+
+  .ai-cmd {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ai-name { color: #c792ea; font-weight: 600; }
+  .ai-args { color: #aaa; }
+
+  .ai-prompt {
+    flex-shrink: 0;
+    font-size: 0.68rem;
+    color: #555;
+    font-family: ui-monospace, monospace;
+  }
+
+  .ai-status {
+    flex-shrink: 0;
+    font-weight: 700;
+  }
+  .ai-status.ok { color: #6bcf6b; }
+  .ai-status.err { color: #ef5350; cursor: help; }
+
+  .ai-cost {
+    flex-shrink: 0;
+    font-size: 0.68rem;
+    color: #d7ba7d;
+    font-family: ui-monospace, monospace;
+  }
+
+  .log-ai-error-detail {
+    padding: 0.05rem 0.75rem 0.3rem 3.2rem;
+    font-size: 0.68rem;
+    color: #ef5350;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
 </style>

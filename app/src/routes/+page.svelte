@@ -1,7 +1,8 @@
 <script lang="ts">
   import { rpc, RpcCallError } from "$lib/rpc";
-  import type { Branch, Commit, CommitFilter, CherryPickResult, CherryPickProgress, RecentRepo, CommitDetail, CommitFile, DryRunItem, ConflictFileInfo, AppSettings, Remote, ForgeConnection, PRSummary } from "$lib/rpc-types";
+  import type { Branch, Commit, CommitFilter, CherryPickResult, CherryPickProgress, RecentRepo, CommitDetail, CommitFile, DryRunItem, ConflictFileInfo, AppSettings, Remote, ForgeConnection, PRSummary, AiResult, FileDiffResult } from "$lib/rpc-types";
   import { parseForge } from "$lib/forge";
+  import { AI_PROVIDERS, renderAiArgs } from "$lib/ai-providers";
   import { invoke } from "@tauri-apps/api/core";
   import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
   import { listen } from "@tauri-apps/api/event";
@@ -21,6 +22,7 @@
   import Toast, { type ToastItem } from "$lib/Toast.svelte";
   import ConnectForge from "$lib/ConnectForge.svelte";
   import CreatePR from "$lib/CreatePR.svelte";
+  import AiReviewModal from "$lib/AiReviewModal.svelte";
 
   // ── settings ──────────────────────────────────────────────
   const DEFAULT_SETTINGS: AppSettings = {
@@ -28,8 +30,12 @@
     externalDiffEnabled: false, externalDiffPath: "", externalDiffArgs: "",
     externalMergeEnabled: false, externalMergePath: "", externalMergeArgs: "",
     checkForUpdatesOnStartup: true,
+    aiEnabled: false, aiProvider: "claude", aiCommand: "", aiArgs: AI_PROVIDERS[0].args,
+    aiModel: "", aiPromptVia: "stdin", aiOutputFormat: "claude-json", aiTimeoutSecs: 120,
   };
   let settings = $state<AppSettings>(DEFAULT_SETTINGS);
+  // M16/M16b — AI conflict resolution available when an executable is configured.
+  const aiAvailable = $derived(settings.aiEnabled && !!settings.aiCommand);
   let settingsOpen = $state(false);
   let pendingUpdate = $state<Update | null>(null);
   let updateDownloading = $state(false);
@@ -283,6 +289,9 @@
       conflictSha = "";
       applyError = "";
       applyResult = null;
+      aiResolved = new Map();
+      aiBackup = new Map();
+      aiReviewOpen = false;
       branches = await rpc.git.branches(repoPath, true);
       const updated = branches.find((b) => b.isHead);
       if (updated) currentBranch = updated.name;
@@ -379,8 +388,173 @@
     applyResult = null;
     applyError = "";
     pendingFinalize = null; // user gave up — don't push/PR on next action
+    aiResolved = new Map();
+    aiBackup = new Map();
+    aiReviewOpen = false;
     conflictBusy = false;
     showToast("warning", "Cherry-pick aborted.");
+  }
+
+  // ── M16/M16b: AI conflict resolution (headless AI CLI agent) ─────────
+  let aiBusy = $state(false);
+  let aiBackup = $state(new Map<string, string>());   // file → original content (with markers)
+  let aiResolved = $state(new Map<string, string>()); // file → AI-merged content, pending review
+  let aiReviewOpen = $state(false);
+  let aiReviewFile = $state("");
+  let aiReviewDiff = $state<FileDiffResult | null>(null);
+
+  function buildConflictPrompt(files: string[]): string {
+    const cc = queue.find(c =>
+      c.sha === conflictSha || c.sha.startsWith(conflictSha) || conflictSha.startsWith(c.sha)
+    );
+    const subject = cc?.subject ?? "";
+    const fileList = files.map(f => `- ${f}`).join("\n");
+    return [
+      "You are resolving git merge conflicts left by a cherry-pick.",
+      subject ? `The commit being applied (\"theirs\") is: "${subject}".` : "",
+      "",
+      "Files currently in conflict:",
+      fileList,
+      "",
+      "For EACH file above:",
+      "1. Read it and locate every conflict region (<<<<<<< ours / ======= / >>>>>>> theirs).",
+      "2. Produce a correct, intelligent merge that keeps BOTH sides' intent where possible — do not blindly pick one side unless the other is clearly redundant.",
+      "3. Overwrite the file with the fully merged result, removing ALL conflict markers (<<<<<<<, =======, >>>>>>>).",
+      "",
+      "Constraints:",
+      "- Edit ONLY the files listed above.",
+      "- Do NOT run git (add/commit/cherry-pick/push/abort) or any shell command — you have no shell access.",
+      "- Do not leave any conflict markers behind.",
+    ].filter(Boolean).join("\n");
+  }
+
+  async function aiResolveAll() {
+    if (!repoPath || aiBusy) return;
+    const files = conflictFiles
+      .filter(f => !resolvedSet.has(f.path) && !aiResolved.has(f.path))
+      .map(f => f.path);
+    if (files.length === 0) return;
+    aiBusy = true;
+    try {
+      // Backup originals (with markers) so a discarded resolution can be undone.
+      const backup = new Map(aiBackup);
+      for (const f of files) {
+        try { backup.set(f, (await rpc.git.fileContent(repoPath, f)).content); } catch { /* best-effort */ }
+      }
+      aiBackup = backup;
+
+      const prompt = buildConflictPrompt(files);
+      const args = renderAiArgs(settings.aiArgs, settings.aiModel, prompt, settings.aiPromptVia);
+      const result = await invoke<AiResult>("run_ai_resolve", {
+        repoPath,
+        command: settings.aiCommand,
+        args,
+        prompt,
+        promptVia: settings.aiPromptVia,
+        outputFormat: settings.aiOutputFormat,
+        timeoutSecs: settings.aiTimeoutSecs,
+      });
+
+      // Read each file back from disk; accept only those with no markers left.
+      const resolved = new Map(aiResolved);
+      const failed: string[] = [];
+      for (const f of files) {
+        try {
+          const c = (await rpc.git.fileContent(repoPath, f)).content;
+          if (c.includes("<<<<<<<") || c.includes(">>>>>>>")) failed.push(f);
+          else resolved.set(f, c);
+        } catch { failed.push(f); }
+      }
+      aiResolved = resolved;
+
+      const okCount = files.length - failed.length;
+      const costStr = result.costUsd ? ` ($${result.costUsd.toFixed(3)})` : "";
+      if (okCount > 0) {
+        showToast("success", `AI resolved ${okCount} file${okCount === 1 ? "" : "s"} — review before staging${costStr}`);
+      }
+      if (failed.length > 0) {
+        const detail = result.isError && result.error ? result.error : failed.join(", ");
+        showToast("warning", `AI could not fully resolve ${failed.length} file${failed.length === 1 ? "" : "s"} — resolve manually`, detail);
+      }
+    } catch (e) {
+      showToast("error", "AI resolve failed", typeof e === "string" ? e : (e instanceof RpcCallError ? e.rpcError.message : String(e)));
+    } finally {
+      aiBusy = false;
+    }
+  }
+
+  async function aiReview(file: string) {
+    if (!repoPath) return;
+
+    // If an external merge tool is configured, reuse the M8 pipeline: the working-tree
+    // file already holds the AI's marker-free merge (Claude wrote it directly, with
+    // Bash disallowed so `git add` never ran) — ExtractConflictFiles copies that as
+    // "output" alongside base/ours/theirs from the still-unmerged index stages, giving
+    // a familiar 4-way view in the user's own tool. Closing the tool stages the result,
+    // same as the manual conflict flow.
+    if (settings.externalMergeEnabled && settings.externalMergePath) {
+      conflictBusy = true;
+      try {
+        const res = await rpc.git.extractConflictFiles(repoPath, file);
+        const template = settings.externalMergeArgs || '"{theirs}" "{ours}" "{base}" "{output}"';
+        const args = buildArgs(template, {
+          base: res.basePath, ours: res.oursPath,
+          theirs: res.theirsPath, output: res.outputPath,
+        });
+        await invoke("launch_and_wait", { program: settings.externalMergePath, args });
+        await rpc.git.stageResolvedFile(repoPath, file, res.outputPath);
+        await rpc.git.cleanupTmpDir(res.tmpDir);
+        resolvedSet = new Set([...resolvedSet, file]);
+        const m = new Map(aiResolved); m.delete(file); aiResolved = m;
+      } catch (e) {
+        showToast("error", "External merge review failed", e instanceof RpcCallError ? e.rpcError.message : String(e));
+      } finally {
+        conflictBusy = false;
+      }
+      return;
+    }
+
+    aiReviewFile = file;
+    aiReviewDiff = null;
+    aiReviewOpen = true;
+    try {
+      aiReviewDiff = await rpc.git.diffTexts(aiBackup.get(file) ?? "", aiResolved.get(file) ?? "");
+    } catch (e) {
+      showToast("error", "Cannot build review diff", e instanceof RpcCallError ? e.rpcError.message : String(e));
+      aiReviewOpen = false;
+    }
+  }
+
+  async function aiAccept(file: string) {
+    if (!repoPath) return;
+    const content = aiResolved.get(file);
+    if (content === undefined) return;
+    conflictBusy = true;
+    try {
+      await rpc.git.writeAndStageFile(repoPath, file, content);
+      resolvedSet = new Set([...resolvedSet, file]);
+      const m = new Map(aiResolved); m.delete(file); aiResolved = m;
+      if (aiReviewOpen && aiReviewFile === file) aiReviewOpen = false;
+    } catch (e) {
+      showToast("error", "Stage failed", e instanceof RpcCallError ? e.rpcError.message : String(e));
+    } finally {
+      conflictBusy = false;
+    }
+  }
+
+  async function aiDiscard(file: string) {
+    if (!repoPath) return;
+    conflictBusy = true;
+    try {
+      await rpc.git.restoreConflict(repoPath, file);
+    } catch (e) {
+      showToast("error", "Restore failed", e instanceof RpcCallError ? e.rpcError.message : String(e));
+    } finally {
+      const m = new Map(aiResolved); m.delete(file); aiResolved = m;
+      const b = new Map(aiBackup); b.delete(file); aiBackup = b;
+      if (aiReviewOpen && aiReviewFile === file) aiReviewOpen = false;
+      conflictBusy = false;
+    }
   }
 
   // ── commit detail (M5a) ───────────────────────────────────
@@ -1130,6 +1304,27 @@
         onabort={abortConflict}
         onviewfile={viewConflictFile}
         onviewdiff={viewConflictFileDiff}
+        aiEnabled={aiAvailable}
+        aiBusy={aiBusy}
+        aiResolvedSet={new Set(aiResolved.keys())}
+        onairesolveall={aiResolveAll}
+        onaireview={aiReview}
+        onaiaccept={aiAccept}
+        onaidiscard={aiDiscard}
+      />
+    {/if}
+
+    {#if aiReviewOpen}
+      <AiReviewModal
+        file={aiReviewFile}
+        diffResult={aiReviewDiff}
+        originalText={aiBackup.get(aiReviewFile) ?? ""}
+        resolvedText={aiResolved.get(aiReviewFile) ?? ""}
+        showEol={settings.showEolMarkers}
+        busy={conflictBusy}
+        onaccept={() => aiAccept(aiReviewFile)}
+        ondiscard={() => aiDiscard(aiReviewFile)}
+        onclose={() => (aiReviewOpen = false)}
       />
     {/if}
 

@@ -2,7 +2,8 @@
   import { invoke } from "@tauri-apps/api/core";
   import { getVersion } from "@tauri-apps/api/app";
   import { open as openDialog } from "@tauri-apps/plugin-dialog";
-  import type { AppSettings, DetectedTool, ForgeConnection } from "./rpc-types";
+  import type { AppSettings, DetectedTool, DetectedAi, ForgeConnection } from "./rpc-types";
+  import { AI_PROVIDERS, findProvider } from "./ai-providers";
 
   interface Props {
     settings: AppSettings;
@@ -19,6 +20,39 @@
 
   let { settings, onclose, onsave, onchecknow, forgeConnection = null, forgeConnectAvailable = false, onconnectforge, ondisconnectforge }: Props = $props();
 
+  let activeTab = $state<"general" | "ai" | "tools" | "accounts">("general");
+
+  // ── modal resize (drag bottom-right corner) ───────────────
+  let modalWidth = $state(660);
+  let modalBodyHeight = $state(460);
+  // Suppresses the overlay's onclose when a resize-drag ends with the
+  // cursor outside the (now-shrunk) modal — see startModalResize.
+  let resizingModal = false;
+
+  function startModalResize(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    resizingModal = true;
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const startW = modalWidth;
+    const startH = modalBodyHeight;
+    function onMove(ev: MouseEvent) {
+      modalWidth = Math.max(560, Math.min(window.innerWidth - 32, startW + (ev.clientX - startX)));
+      modalBodyHeight = Math.max(320, Math.min(window.innerHeight - 160, startH + (ev.clientY - startY)));
+    }
+    function onUp() {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      // Defer reset until after the synthetic "click" the browser fires on
+      // mouseup (its target may be the overlay if the modal shrank away
+      // from the cursor) has been dispatched and ignored below.
+      setTimeout(() => { resizingModal = false; }, 0);
+    }
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
   let maxCommits = $state(settings.maxCommits);
   let defaultApplyMode = $state(settings.defaultApplyMode);
   let showEolMarkers = $state(settings.showEolMarkers);
@@ -33,6 +67,34 @@
   let externalMergeEnabled = $state(settings.externalMergeEnabled);
   let externalMergePath = $state(settings.externalMergePath);
   let externalMergeArgs = $state(settings.externalMergeArgs);
+  // M16/M16b — AI conflict resolution (generic engine + provider presets)
+  let aiEnabled = $state(settings.aiEnabled);
+  let aiProvider = $state(settings.aiProvider || "claude");
+  let aiCommand = $state(settings.aiCommand);
+  let aiArgs = $state(settings.aiArgs);
+  let aiModel = $state(settings.aiModel);
+  let aiPromptVia = $state(settings.aiPromptVia || "stdin");
+  let aiOutputFormat = $state(settings.aiOutputFormat || "claude-json");
+  let aiTimeoutSecs = $state(settings.aiTimeoutSecs);
+  let detectingAi = $state(false);
+  let aiDetectResult = $state<DetectedAi | null>(null);
+  let showAiAdvanced = $state(false);
+  const currentProvider = $derived(findProvider(aiProvider));
+
+  /** Apply a preset's defaults into the editable fields (command stays unless empty). */
+  function applyProvider(id: string) {
+    aiProvider = id;
+    aiDetectResult = null;
+    const p = findProvider(id);
+    if (id !== "custom") {
+      aiCommand = p.command;
+      aiArgs = p.args;
+      aiPromptVia = p.promptVia;
+      aiOutputFormat = p.outputFormat;
+      // Reset model if the new provider doesn't offer the current value.
+      if (p.models.length && !p.models.some((m) => m.value === aiModel)) aiModel = "";
+    }
+  }
 
   // App version — pulled from tauri.conf.json at runtime via Tauri API.
   // Async (waits for IPC). Empty string until resolved, so the badge area
@@ -71,6 +133,8 @@
       externalDiffEnabled, externalDiffPath, externalDiffArgs,
       externalMergeEnabled, externalMergePath, externalMergeArgs,
       checkForUpdatesOnStartup,
+      aiEnabled, aiProvider, aiCommand, aiArgs, aiModel, aiPromptVia, aiOutputFormat, aiTimeoutSecs,
+      forgeConnections: settings.forgeConnections,
     });
     onclose();
   }
@@ -118,269 +182,453 @@
     });
     if (result) externalMergePath = result as string;
   }
+
+  async function detectAi() {
+    detectingAi = true;
+    try {
+      const name = aiCommand || currentProvider.command;
+      const r = await invoke<DetectedAi>("detect_ai_tool", { command: name });
+      aiDetectResult = r;
+      if (r.found) aiCommand = r.path;
+    } catch {
+      aiDetectResult = { found: false, path: "", version: "" };
+    } finally {
+      detectingAi = false;
+    }
+  }
+
+  async function browseAiExe() {
+    const result = await openDialog({
+      title: "Select AI CLI executable",
+      filters: [{ name: "Executable", extensions: ["cmd", "exe", "bat"] }],
+      multiple: false,
+    });
+    if (result) aiCommand = result as string;
+  }
 </script>
 
 <svelte:window onkeydown={onKeydown} />
 
-<div class="overlay" onclick={onclose} role="presentation">
-  <div class="modal" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Settings">
+<div
+  class="overlay"
+  onclick={() => {
+    if (resizingModal) { resizingModal = false; return; }
+    onclose();
+  }}
+  role="presentation"
+>
+  <div class="modal" style="width: {modalWidth}px" onclick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Settings">
     <div class="modal-header">
       <span class="modal-title">Settings</span>
       <button class="close-btn" onclick={onclose} aria-label="Close">✕</button>
     </div>
 
-    <div class="modal-body">
-      <div class="setting-row">
-        <label class="setting-label" for="max-commits">Max commits to load</label>
-        <input
-          id="max-commits"
-          type="number"
-          class="setting-input"
-          bind:value={maxCommits}
-          min={10}
-          max={5000}
-          step={50}
-        />
-      </div>
-
-      <div class="setting-row">
-        <label class="setting-label" for="apply-mode">Default apply mode</label>
-        <select id="apply-mode" class="setting-select" bind:value={defaultApplyMode}>
-          <option value="apply">Apply only</option>
-          <option value="apply-push">Apply &amp; Push</option>
-        </select>
-      </div>
-
-      <div class="setting-row">
-        <span class="setting-label">Show EOL markers (¶)</span>
-        <button
-          class="toggle"
-          class:on={showEolMarkers}
-          onclick={() => (showEolMarkers = !showEolMarkers)}
-          aria-checked={showEolMarkers}
-          role="switch"
-        >
-          {showEolMarkers ? "On" : "Off"}
+    <div class="modal-body" style="height: {modalBodyHeight}px">
+      <div class="settings-sidebar">
+        <button class="tab-btn" class:active={activeTab === "general"} onclick={() => (activeTab = "general")}>
+          <span class="tab-icon">⚙</span> General
+        </button>
+        <button class="tab-btn" class:active={activeTab === "ai"} onclick={() => (activeTab = "ai")}>
+          <span class="tab-icon">🤖</span> AI Resolution
+        </button>
+        <button class="tab-btn" class:active={activeTab === "tools"} onclick={() => (activeTab = "tools")}>
+          <span class="tab-icon">🔧</span> External Tools
+        </button>
+        <button class="tab-btn" class:active={activeTab === "accounts"} onclick={() => (activeTab = "accounts")}>
+          <span class="tab-icon">🔗</span> Accounts
         </button>
       </div>
 
-      <div class="setting-row">
-        <span class="setting-label">Auto-fetch on repo open</span>
-        <button
-          class="toggle"
-          class:on={autoFetchOnOpen}
-          onclick={() => (autoFetchOnOpen = !autoFetchOnOpen)}
-          aria-checked={autoFetchOnOpen}
-          role="switch"
-        >
-          {autoFetchOnOpen ? "On" : "Off"}
-        </button>
-      </div>
+      <div class="settings-content">
+        {#if activeTab === "general"}
+          <h3 class="tab-heading">General</h3>
 
-      <div class="setting-row">
-        <span class="setting-label">Theme</span>
-        <div class="theme-seg">
-          <button class="seg-btn" class:active={theme === "dark"} onclick={() => (theme = "dark")}>Dark</button>
-          <button class="seg-btn" class:active={theme === "light"} onclick={() => (theme = "light")}>Light</button>
-        </div>
-      </div>
-
-      <div class="setting-row">
-        <span class="setting-label">Check for updates on startup</span>
-        <div class="row-right">
-          <button
-            class="toggle"
-            class:on={checkForUpdatesOnStartup}
-            onclick={() => (checkForUpdatesOnStartup = !checkForUpdatesOnStartup)}
-            aria-checked={checkForUpdatesOnStartup}
-            role="switch"
-          >
-            {checkForUpdatesOnStartup ? "On" : "Off"}
-          </button>
-          <button
-            class="btn-check-now"
-            disabled={checkingNow}
-            onclick={async () => {
-              checkingNow = true;
-              checkResult = null;
-              const found = await onchecknow?.();
-              checkResult = found ? "found" : "up-to-date";
-              checkingNow = false;
-            }}
-          >
-            {checkingNow ? "Checking…" : "Check Now"}
-          </button>
-          {#if checkResult === "up-to-date"}
-            <span class="check-ok">✓ Up to date</span>
-          {:else if checkResult === "found"}
-            <span class="check-found">Update found!</span>
-          {/if}
-        </div>
-      </div>
-
-      <!-- M14 — Connected accounts -->
-      <div class="section-sep">Connected accounts</div>
-
-      <div class="row">
-        <label class="label">Forge (for PR creation)</label>
-        <div class="forge-info">
-          {#if !forgeConnectAvailable}
-            <span class="hint">Open a repo to configure a forge connection.</span>
-          {:else if forgeConnection}
-            <span class="connected-label">
-              <strong>{forgeConnection.kind === "github" ? "GitHub" : forgeConnection.kind === "gitlab" ? "GitLab" : "Bitbucket"}</strong>
-              · {forgeConnection.host}
-              · <span class="mono">{forgeConnection.username}</span>
-            </span>
-            <button class="forge-action danger" onclick={() => ondisconnectforge?.()}>
-              Disconnect
-            </button>
-            <button class="forge-action" onclick={() => onconnectforge?.()}>
-              Reconnect
-            </button>
-          {:else}
-            <span class="hint">No connection for this repo.</span>
-            <button class="forge-action primary" onclick={() => onconnectforge?.()}>
-              Connect…
-            </button>
-          {/if}
-        </div>
-      </div>
-
-      <!-- External Tools -->
-      <div class="section-sep">External Tools</div>
-
-      <!-- Auto-detect -->
-      <div class="detect-row">
-        <button class="detect-btn" onclick={autoDetect} disabled={detecting}>
-          {detecting ? "Detecting…" : "Auto-detect installed tools"}
-        </button>
-        {#if detectedTools.length > 0}
-          <div class="detected-pills">
-            {#each detectedTools as t}
-              <button class="pill" onclick={() => applyDetected(t)} title="Fill path with {t.name}">{t.name}</button>
-            {/each}
+          <div class="setting-row">
+            <label class="setting-label" for="max-commits">Max commits to load</label>
+            <input
+              id="max-commits"
+              type="number"
+              class="setting-input"
+              bind:value={maxCommits}
+              min={10}
+              max={5000}
+              step={50}
+            />
           </div>
-        {:else if !detecting}
-          <span class="detect-hint">Click to scan common install paths</span>
-        {/if}
-      </div>
 
-      <!-- External Diff Viewer -->
-      <div class="tool-block">
-        <div class="tool-header">
-          <span class="tool-name">External Diff Viewer</span>
-          <button
-            class="toggle"
-            class:on={externalDiffEnabled}
-            onclick={() => (externalDiffEnabled = !externalDiffEnabled)}
-            aria-checked={externalDiffEnabled}
-            role="switch"
-          >
-            {externalDiffEnabled ? "On" : "Off"}
-          </button>
-        </div>
-        {#if externalDiffEnabled}
-          <div class="tool-field">
-            <label class="field-label" for="diff-path">Executable path</label>
-            <div class="path-row">
-              <input
-                id="diff-path"
-                class="setting-input-full"
-                bind:value={externalDiffPath}
-                placeholder='C:\Program Files\TortoiseGit\bin\TortoiseGitProc.exe'
-                spellcheck="false"
-              />
-              <button class="browse-btn" onclick={browseDiffExe} title="Browse for executable">…</button>
+          <div class="setting-row">
+            <label class="setting-label" for="apply-mode">Default apply mode</label>
+            <select id="apply-mode" class="setting-select" bind:value={defaultApplyMode}>
+              <option value="apply">Apply only</option>
+              <option value="apply-push">Apply &amp; Push</option>
+            </select>
+          </div>
+
+          <div class="setting-row">
+            <span class="setting-label">Show EOL markers (¶)</span>
+            <button
+              class="toggle"
+              class:on={showEolMarkers}
+              onclick={() => (showEolMarkers = !showEolMarkers)}
+              aria-checked={showEolMarkers}
+              role="switch"
+            >
+              {showEolMarkers ? "On" : "Off"}
+            </button>
+          </div>
+
+          <div class="setting-row">
+            <span class="setting-label">Auto-fetch on repo open</span>
+            <button
+              class="toggle"
+              class:on={autoFetchOnOpen}
+              onclick={() => (autoFetchOnOpen = !autoFetchOnOpen)}
+              aria-checked={autoFetchOnOpen}
+              role="switch"
+            >
+              {autoFetchOnOpen ? "On" : "Off"}
+            </button>
+          </div>
+
+          <div class="setting-row">
+            <span class="setting-label">Theme</span>
+            <div class="theme-seg">
+              <button class="seg-btn" class:active={theme === "dark"} onclick={() => (theme = "dark")}>Dark</button>
+              <button class="seg-btn" class:active={theme === "light"} onclick={() => (theme = "light")}>Light</button>
             </div>
           </div>
-          <div class="tool-field">
-            <label class="field-label" for="diff-args">Arguments template</label>
-            <input
-              id="diff-args"
-              class="setting-input-full"
-              bind:value={externalDiffArgs}
-              placeholder={DIFF_ARGS_PLACEHOLDER}
-              spellcheck="false"
-            />
-            <span class="arg-hint">{DIFF_ARGS_HINT}</span>
-          </div>
-        {/if}
-      </div>
 
-      <!-- External Merge Tool -->
-      <div class="tool-block">
-        <div class="tool-header">
-          <span class="tool-name">External Merge Tool</span>
-          <button
-            class="toggle"
-            class:on={externalMergeEnabled}
-            onclick={() => (externalMergeEnabled = !externalMergeEnabled)}
-            aria-checked={externalMergeEnabled}
-            role="switch"
-          >
-            {externalMergeEnabled ? "On" : "Off"}
-          </button>
-        </div>
-        {#if externalMergeEnabled}
-          <div class="tool-field">
-            <label class="field-label" for="merge-path">Executable path</label>
-            <div class="path-row">
-              <input
-                id="merge-path"
-                class="setting-input-full"
-                bind:value={externalMergePath}
-                placeholder='C:\Program Files\TortoiseGit\bin\TortoiseGitProc.exe'
-                spellcheck="false"
-              />
-              <button class="browse-btn" onclick={browseMergeExe} title="Browse for executable">…</button>
+          <div class="setting-row">
+            <span class="setting-label">Check for updates on startup</span>
+            <div class="row-right">
+              <button
+                class="toggle"
+                class:on={checkForUpdatesOnStartup}
+                onclick={() => (checkForUpdatesOnStartup = !checkForUpdatesOnStartup)}
+                aria-checked={checkForUpdatesOnStartup}
+                role="switch"
+              >
+                {checkForUpdatesOnStartup ? "On" : "Off"}
+              </button>
+              <button
+                class="btn-check-now"
+                disabled={checkingNow}
+                onclick={async () => {
+                  checkingNow = true;
+                  checkResult = null;
+                  const found = await onchecknow?.();
+                  checkResult = found ? "found" : "up-to-date";
+                  checkingNow = false;
+                }}
+              >
+                {checkingNow ? "Checking…" : "Check Now"}
+              </button>
+              {#if checkResult === "up-to-date"}
+                <span class="check-ok">✓ Up to date</span>
+              {:else if checkResult === "found"}
+                <span class="check-found">Update found!</span>
+              {/if}
             </div>
           </div>
-          <div class="tool-field">
-            <label class="field-label" for="merge-args">Arguments template</label>
-            <input
-              id="merge-args"
-              class="setting-input-full"
-              bind:value={externalMergeArgs}
-              placeholder={MERGE_ARGS_PLACEHOLDER}
-              spellcheck="false"
-            />
-            <span class="arg-hint">{MERGE_ARGS_HINT}</span>
+
+        {:else if activeTab === "ai"}
+          <h3 class="tab-heading">AI Conflict Resolution</h3>
+
+          <div class="tool-block">
+            <div class="tool-header">
+              <span class="tool-name">Resolve conflicts with an AI CLI</span>
+              <button
+                class="toggle"
+                class:on={aiEnabled}
+                onclick={() => (aiEnabled = !aiEnabled)}
+                aria-checked={aiEnabled}
+                role="switch"
+              >
+                {aiEnabled ? "On" : "Off"}
+              </button>
+            </div>
+            {#if aiEnabled}
+              <p class="ai-note">
+                On conflict, click “🤖 AI resolve all” — the chosen CLI agent writes a merged
+                version to disk, which you review before staging. Uses the tool's own login
+                (no API key stored here). {currentProvider.note}
+              </p>
+
+              <div class="tool-field">
+                <label class="field-label" for="ai-provider">Provider</label>
+                <select
+                  id="ai-provider"
+                  class="setting-select"
+                  value={aiProvider}
+                  onchange={(e) => applyProvider((e.currentTarget as HTMLSelectElement).value)}
+                >
+                  {#each AI_PROVIDERS as p}
+                    <option value={p.id}>{p.label}</option>
+                  {/each}
+                </select>
+              </div>
+
+              <div class="tool-field">
+                <label class="field-label" for="ai-path">Executable (name or full path)</label>
+                <div class="path-row">
+                  <input
+                    id="ai-path"
+                    class="setting-input-full"
+                    bind:value={aiCommand}
+                    placeholder={currentProvider.command || "e.g. claude / gemini / full path"}
+                    spellcheck="false"
+                  />
+                  <button class="browse-btn" onclick={browseAiExe} title="Browse for executable">…</button>
+                </div>
+                <div class="detect-row">
+                  <button class="detect-btn" onclick={detectAi} disabled={detectingAi}>
+                    {detectingAi ? "Detecting…" : "Detect"}
+                  </button>
+                  {#if aiDetectResult}
+                    {#if aiDetectResult.found}
+                      <span class="detect-hint ok">✓ {aiDetectResult.version || "found"}</span>
+                    {:else}
+                      <span class="detect-hint err">Not found — install it or set the path manually</span>
+                    {/if}
+                  {/if}
+                </div>
+              </div>
+
+              <div class="tool-field ai-row">
+                <div class="ai-field">
+                  <label class="field-label" for="ai-model">Model</label>
+                  {#if currentProvider.models.length}
+                    <select id="ai-model" class="setting-select" bind:value={aiModel}>
+                      {#each currentProvider.models as m}
+                        <option value={m.value}>{m.label}</option>
+                      {/each}
+                    </select>
+                  {:else}
+                    <input
+                      id="ai-model"
+                      class="setting-input"
+                      bind:value={aiModel}
+                      placeholder="(tool default)"
+                      spellcheck="false"
+                    />
+                  {/if}
+                </div>
+                <div class="ai-field">
+                  <label class="field-label" for="ai-timeout">Timeout (seconds)</label>
+                  <input
+                    id="ai-timeout"
+                    class="setting-input"
+                    type="number"
+                    min="10"
+                    max="900"
+                    bind:value={aiTimeoutSecs}
+                  />
+                </div>
+              </div>
+
+              <button class="advanced-toggle" onclick={() => (showAiAdvanced = !showAiAdvanced)}>
+                {showAiAdvanced ? "▾" : "▸"} Advanced (command flags)
+              </button>
+              {#if showAiAdvanced}
+                <div class="tool-field">
+                  <label class="field-label" for="ai-args">Args template</label>
+                  <input
+                    id="ai-args"
+                    class="setting-input-full"
+                    bind:value={aiArgs}
+                    placeholder="flags… use {'{model}'} and {'{prompt}'}"
+                    spellcheck="false"
+                  />
+                  <span class="ai-note">
+                    <code>{'{model}'}</code> → model value (dropped with its flag when empty).
+                    <code>{'{prompt}'}</code> → the prompt, only when “Prompt via” is <em>arg</em>.
+                  </span>
+                </div>
+                <div class="tool-field ai-row">
+                  <div class="ai-field">
+                    <label class="field-label" for="ai-prompt-via">Prompt via</label>
+                    <select id="ai-prompt-via" class="setting-select" bind:value={aiPromptVia}>
+                      <option value="stdin">stdin (safest)</option>
+                      <option value="arg">argument ({'{prompt}'})</option>
+                    </select>
+                  </div>
+                  <div class="ai-field">
+                    <label class="field-label" for="ai-output">Output format</label>
+                    <select id="ai-output" class="setting-select" bind:value={aiOutputFormat}>
+                      <option value="claude-json">claude-json (cost + status)</option>
+                      <option value="none">none (exit code only)</option>
+                    </select>
+                  </div>
+                </div>
+              {/if}
+            {/if}
+          </div>
+
+        {:else if activeTab === "tools"}
+          <h3 class="tab-heading">External Tools</h3>
+
+          <!-- Auto-detect -->
+          <div class="detect-row">
+            <button class="detect-btn" onclick={autoDetect} disabled={detecting}>
+              {detecting ? "Detecting…" : "Auto-detect installed tools"}
+            </button>
+            {#if detectedTools.length > 0}
+              <div class="detected-pills">
+                {#each detectedTools as t}
+                  <button class="pill" onclick={() => applyDetected(t)} title="Fill path with {t.name}">{t.name}</button>
+                {/each}
+              </div>
+            {:else if !detecting}
+              <span class="detect-hint">Click to scan common install paths</span>
+            {/if}
+          </div>
+
+          <!-- External Diff Viewer -->
+          <div class="tool-block">
+            <div class="tool-header">
+              <span class="tool-name">External Diff Viewer</span>
+              <button
+                class="toggle"
+                class:on={externalDiffEnabled}
+                onclick={() => (externalDiffEnabled = !externalDiffEnabled)}
+                aria-checked={externalDiffEnabled}
+                role="switch"
+              >
+                {externalDiffEnabled ? "On" : "Off"}
+              </button>
+            </div>
+            {#if externalDiffEnabled}
+              <div class="tool-field">
+                <label class="field-label" for="diff-path">Executable path</label>
+                <div class="path-row">
+                  <input
+                    id="diff-path"
+                    class="setting-input-full"
+                    bind:value={externalDiffPath}
+                    placeholder='C:\Program Files\TortoiseGit\bin\TortoiseGitProc.exe'
+                    spellcheck="false"
+                  />
+                  <button class="browse-btn" onclick={browseDiffExe} title="Browse for executable">…</button>
+                </div>
+              </div>
+              <div class="tool-field">
+                <label class="field-label" for="diff-args">Arguments template</label>
+                <input
+                  id="diff-args"
+                  class="setting-input-full"
+                  bind:value={externalDiffArgs}
+                  placeholder={DIFF_ARGS_PLACEHOLDER}
+                  spellcheck="false"
+                />
+                <span class="arg-hint">{DIFF_ARGS_HINT}</span>
+              </div>
+            {/if}
+          </div>
+
+          <!-- External Merge Tool -->
+          <div class="tool-block">
+            <div class="tool-header">
+              <span class="tool-name">External Merge Tool</span>
+              <button
+                class="toggle"
+                class:on={externalMergeEnabled}
+                onclick={() => (externalMergeEnabled = !externalMergeEnabled)}
+                aria-checked={externalMergeEnabled}
+                role="switch"
+              >
+                {externalMergeEnabled ? "On" : "Off"}
+              </button>
+            </div>
+            {#if externalMergeEnabled}
+              <div class="tool-field">
+                <label class="field-label" for="merge-path">Executable path</label>
+                <div class="path-row">
+                  <input
+                    id="merge-path"
+                    class="setting-input-full"
+                    bind:value={externalMergePath}
+                    placeholder='C:\Program Files\TortoiseGit\bin\TortoiseGitProc.exe'
+                    spellcheck="false"
+                  />
+                  <button class="browse-btn" onclick={browseMergeExe} title="Browse for executable">…</button>
+                </div>
+              </div>
+              <div class="tool-field">
+                <label class="field-label" for="merge-args">Arguments template</label>
+                <input
+                  id="merge-args"
+                  class="setting-input-full"
+                  bind:value={externalMergeArgs}
+                  placeholder={MERGE_ARGS_PLACEHOLDER}
+                  spellcheck="false"
+                />
+                <span class="arg-hint">{MERGE_ARGS_HINT}</span>
+              </div>
+            {/if}
+          </div>
+
+          <!-- Reference -->
+          <button class="ref-toggle" onclick={() => (showRef = !showRef)}>
+            {showRef ? "▾" : "▸"} Reference: common tool args
+          </button>
+          {#if showRef}
+            <table class="ref-table">
+              <thead><tr><th>Tool</th><th>Diff args</th><th>Merge args</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>TortoiseGit<br/><small class="ref-note">diff: TortoiseGitProc.exe<br/>merge: TortoiseGitMerge.exe</small></td>
+                  <td><code>/command:diff /path:"{"{left}"}" /path2:"{"{right}"}"</code></td>
+                  <td><code>/base:"{"{base}"}" /theirs:"{"{theirs}"}" /mine:"{"{ours}"}" /merged:"{"{output}"}"</code></td>
+                </tr>
+                <tr>
+                  <td>Beyond Compare</td>
+                  <td><code>"{"{left}"}" "{"{right}"}"</code></td>
+                  <td><code>"{"{theirs}"}" "{"{ours}"}" "{"{base}"}" "{"{output}"}"</code></td>
+                </tr>
+                <tr>
+                  <td>WinMerge</td>
+                  <td><code>"{"{left}"}" "{"{right}"}"</code></td>
+                  <td><code>/e /ub /wl /wr "{"{ours}"}" "{"{base}"}" "{"{theirs}"}" "{"{output}"}"</code></td>
+                </tr>
+                <tr>
+                  <td>VSCode</td>
+                  <td><code>--diff "{"{left}"}" "{"{right}"}"</code></td>
+                  <td>—</td>
+                </tr>
+              </tbody>
+            </table>
+          {/if}
+
+        {:else if activeTab === "accounts"}
+          <h3 class="tab-heading">Connected Accounts</h3>
+
+          <div class="row">
+            <label class="label">Forge (for PR creation)</label>
+            <div class="forge-info">
+              {#if !forgeConnectAvailable}
+                <span class="hint">Open a repo to configure a forge connection.</span>
+              {:else if forgeConnection}
+                <span class="connected-label">
+                  <strong>{forgeConnection.kind === "github" ? "GitHub" : forgeConnection.kind === "gitlab" ? "GitLab" : "Bitbucket"}</strong>
+                  · {forgeConnection.host}
+                  · <span class="mono">{forgeConnection.username}</span>
+                </span>
+                <button class="forge-action danger" onclick={() => ondisconnectforge?.()}>
+                  Disconnect
+                </button>
+                <button class="forge-action" onclick={() => onconnectforge?.()}>
+                  Reconnect
+                </button>
+              {:else}
+                <span class="hint">No connection for this repo.</span>
+                <button class="forge-action primary" onclick={() => onconnectforge?.()}>
+                  Connect…
+                </button>
+              {/if}
+            </div>
           </div>
         {/if}
       </div>
-
-      <!-- Reference -->
-      <button class="ref-toggle" onclick={() => (showRef = !showRef)}>
-        {showRef ? "▾" : "▸"} Reference: common tool args
-      </button>
-      {#if showRef}
-        <table class="ref-table">
-          <thead><tr><th>Tool</th><th>Diff args</th><th>Merge args</th></tr></thead>
-          <tbody>
-            <tr>
-              <td>TortoiseGit<br/><small class="ref-note">diff: TortoiseGitProc.exe<br/>merge: TortoiseGitMerge.exe</small></td>
-              <td><code>/command:diff /path:"{"{left}"}" /path2:"{"{right}"}"</code></td>
-              <td><code>/base:"{"{base}"}" /theirs:"{"{theirs}"}" /mine:"{"{ours}"}" /merged:"{"{output}"}"</code></td>
-            </tr>
-            <tr>
-              <td>Beyond Compare</td>
-              <td><code>"{"{left}"}" "{"{right}"}"</code></td>
-              <td><code>"{"{theirs}"}" "{"{ours}"}" "{"{base}"}" "{"{output}"}"</code></td>
-            </tr>
-            <tr>
-              <td>WinMerge</td>
-              <td><code>"{"{left}"}" "{"{right}"}"</code></td>
-              <td><code>/e /ub /wl /wr "{"{ours}"}" "{"{base}"}" "{"{theirs}"}" "{"{output}"}"</code></td>
-            </tr>
-            <tr>
-              <td>VSCode</td>
-              <td><code>--diff "{"{left}"}" "{"{right}"}"</code></td>
-              <td>—</td>
-            </tr>
-          </tbody>
-        </table>
-      {/if}
     </div>
 
     <div class="modal-footer">
@@ -390,6 +638,13 @@
       <button class="cancel-btn" onclick={onclose}>Cancel</button>
       <button class="save-btn" onclick={save}>Save</button>
     </div>
+
+    <div
+      class="modal-resize-handle"
+      onmousedown={startModalResize}
+      role="separator"
+      aria-label="Resize settings window"
+    ></div>
   </div>
 </div>
 
@@ -404,10 +659,10 @@
     z-index: 500;
   }
   .modal {
+    position: relative;
     background: var(--surface, #252525);
     border: 1px solid var(--border, #3a3a3a);
     border-radius: 10px;
-    width: 460px;
     max-width: calc(100vw - 2rem);
     max-height: 90vh;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
@@ -439,12 +694,89 @@
   .close-btn:hover { color: var(--text, #f0f0f0); background: var(--hover, #3a3a3a); }
 
   .modal-body {
-    padding: 0.75rem 1rem;
+    display: flex;
+    flex: 0 1 auto;
+    overflow: hidden;
+  }
+
+  /* ── resize handle (bottom-right corner) ── */
+  .modal-resize-handle {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    width: 18px;
+    height: 18px;
+    cursor: nwse-resize;
+    z-index: 10;
+  }
+  .modal-resize-handle::before {
+    content: "";
+    position: absolute;
+    right: 4px;
+    bottom: 4px;
+    width: 8px;
+    height: 8px;
+    border-right: 2px solid var(--border, #555);
+    border-bottom: 2px solid var(--border, #555);
+    border-radius: 0 0 3px 0;
+  }
+  .modal-resize-handle:hover::before { border-color: var(--accent, #4a7ef5); }
+
+  /* ── sidebar tabs ── */
+  .settings-sidebar {
+    display: flex;
+    flex-direction: column;
+    gap: 0.15rem;
+    width: 152px;
+    flex-shrink: 0;
+    padding: 0.75rem 0.5rem;
+    border-right: 1px solid var(--border, #3a3a3a);
+    overflow-y: auto;
+  }
+  .tab-btn {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.45rem 0.6rem;
+    border: none;
+    border-radius: 6px;
+    background: none;
+    color: var(--text-secondary, #aaa);
+    font-size: 0.83rem;
+    text-align: left;
+    cursor: pointer;
+    transition: background 0.12s, color 0.12s;
+  }
+  .tab-btn:hover { background: var(--hover, #3a3a3a); color: var(--text, #f0f0f0); }
+  .tab-btn.active {
+    background: var(--selected, rgba(74, 126, 245, 0.18));
+    color: var(--text, #f0f0f0);
+    font-weight: 600;
+  }
+  .tab-icon {
+    font-size: 0.95rem;
+    width: 1.2em;
+    text-align: center;
+    flex-shrink: 0;
+  }
+
+  /* ── content pane ── */
+  .settings-content {
+    flex: 1;
+    min-width: 0;
     display: flex;
     flex-direction: column;
     gap: 0.75rem;
+    padding: 0.85rem 1rem;
     overflow-y: auto;
   }
+  .tab-heading {
+    font-size: 0.92rem;
+    font-weight: 600;
+    color: var(--text, #f0f0f0);
+    margin: 0;
+  }
+
   .setting-row {
     display: flex;
     align-items: center;
@@ -500,17 +832,6 @@
     color: #fff;
   }
 
-  /* ── section separator ── */
-  .section-sep {
-    font-size: 0.72rem;
-    font-weight: 600;
-    color: var(--text-muted, #666);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    padding-top: 0.25rem;
-    border-top: 1px solid var(--border, #3a3a3a);
-    margin-top: 0.25rem;
-  }
   .forge-info {
     display: flex;
     align-items: center;
@@ -571,6 +892,36 @@
   .detect-btn:hover:not(:disabled) { background: var(--hover, #3a3a3a); color: var(--text, #f0f0f0); }
   .detect-btn:disabled { opacity: 0.5; cursor: default; }
   .detect-hint { font-size: 0.72rem; color: var(--text-muted, #666); }
+  .detect-hint.ok { color: #66bb6a; }
+  .detect-hint.err { color: #e05555; }
+  .ai-note {
+    font-size: 0.74rem;
+    color: var(--text-secondary, #aaa);
+    line-height: 1.45;
+    margin: 0.1rem 0 0.6rem;
+  }
+  .ai-row { display: flex; gap: 1rem; }
+  .ai-field { flex: 1; display: flex; flex-direction: column; gap: 0.25rem; }
+  .ai-field .setting-input,
+  .ai-field .setting-select { width: 100%; }
+  .ai-note code {
+    font-family: ui-monospace, monospace;
+    font-size: 0.7rem;
+    background: var(--input-bg, #2a2a2a);
+    padding: 0.05rem 0.3rem;
+    border-radius: 3px;
+  }
+  .advanced-toggle {
+    background: none;
+    border: none;
+    color: var(--text-secondary, #aaa);
+    font-size: 0.76rem;
+    cursor: pointer;
+    padding: 0.2rem 0;
+    margin: 0.1rem 0 0.4rem;
+    text-align: left;
+  }
+  .advanced-toggle:hover { color: var(--text, #f0f0f0); }
   .detected-pills { display: flex; gap: 0.3rem; flex-wrap: wrap; }
   .pill {
     padding: 0.18rem 0.55rem;
