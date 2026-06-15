@@ -1,6 +1,6 @@
 {
   "name": "lazy-cherry-pick-mcp",
-  "version": "0.16.0",
+  "version": "0.17.0",
   "sidecarSha256": "",
   "description": "MCP server for Lazy Cherry Pick: AI tools for git status, branches, commits, diffs, cherry-pick, fetch/pull/push, and conflict resolution. Run via npx, no desktop install needed.",
   "license": "MIT",

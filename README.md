@@ -235,7 +235,7 @@ See [docs/IPC.md](./docs/IPC.md) for all NDJSON method signatures, or [docs/MCP.
 - ✅ **M16** AI conflict resolution (desktop → headless AI CLI) — "🤖 AI resolve all", review-before-stage with a 3-way view matching the manual editor (or external merge tool), provider-agnostic presets (Claude Code verified), AI calls logged in the Git Console
 - ✅ **M11** Advanced pick — auto-stash before apply (M11a), squash queued commits into one + per-commit message override (M11b), partial-file pick (M11c)
 - ✅ **M14f** Accounts tab — manage forge connections across all repos (Test / Reconnect / Disconnect), connect a recent repo without opening it
-- 🔜 **M12** Performance & large repos — virtual scroll (drop the maxCommits ceiling), background fetch, per-branch cache
+- ✅ **M12** Performance & large repos — incremental "virtual scroll" load (maxCommits becomes a page size), opt-in background fetch with a "N new commits" badge, per-branch session commit cache
 - 🔜 **M14e** Multi-forge per repo — connect one repo to several forges, pick forge per remote, warn on remote/forge mismatch
 - 🔜 **M15b+** — forge tools over MCP, MCP Sampling, further polish
 
