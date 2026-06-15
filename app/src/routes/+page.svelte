@@ -32,6 +32,7 @@
     checkForUpdatesOnStartup: true, autoStash: false,
     aiEnabled: false, aiProvider: "claude", aiCommand: "", aiArgs: AI_PROVIDERS[0].args,
     aiModel: "", aiPromptVia: "stdin", aiOutputFormat: "claude-json", aiTimeoutSecs: 120,
+    backgroundFetchEnabled: false, backgroundFetchIntervalSecs: 300,
   };
   let settings = $state<AppSettings>(DEFAULT_SETTINGS);
   // M16/M16b — AI conflict resolution available when an executable is configured.
@@ -177,6 +178,39 @@
   let targetBranch = $state("");
   let commits = $state<Commit[]>([]);
   let loadingCommits = $state(false);
+  // ── M12a — virtual scroll / incremental load ──────────────
+  let hasMoreCommits = $state(true);
+  let loadingMoreCommits = $state(false);
+  // ── M12b — background fetch + "N new commits" badge ───────
+  let newCommitsCount = $state(0);
+  let newCommitsUpstream = $state("");
+
+  // ── M12c — per-branch commit-list cache for the current session ──────────
+  // Non-reactive: read/written directly (not $state) — consumers re-read
+  // commits/hasMoreCommits/appliedShas synchronously after a cache restore.
+  // Capped at BRANCH_CACHE_MAX entries, FIFO eviction via Map insertion order.
+  // Only populated when activeFilter is empty (the default browsing view).
+  const branchCommitCache = new Map<string, { commits: Commit[]; hasMore: boolean; appliedShas: Set<string> }>();
+  const BRANCH_CACHE_MAX = 20;
+
+  /** M12c — write (or refresh) a branch's cache entry, evicting the oldest
+   * entry once over BRANCH_CACHE_MAX. */
+  function cacheBranchCommits(branch: string, commitList: Commit[], hasMore: boolean, applied: Set<string>) {
+    branchCommitCache.delete(branch); // re-insert at the end (most-recently-used)
+    branchCommitCache.set(branch, { commits: commitList, hasMore, appliedShas: new Set(applied) });
+    if (branchCommitCache.size > BRANCH_CACHE_MAX) {
+      const oldestKey = branchCommitCache.keys().next().value;
+      if (oldestKey !== undefined) branchCommitCache.delete(oldestKey);
+    }
+  }
+
+  /** M12c — drop cached entries for the source/target branches after an apply
+   * (cherry-pick/squash/partial-pick) that may have changed their commit list
+   * or "Applied" set. */
+  function invalidateBranchCache() {
+    branchCommitCache.delete(sourceBranch);
+    branchCommitCache.delete(targetBranch);
+  }
 
   // ── selection: Map preserves insertion order for queue ─────
   let selectionMap = $state(new Map<string, Commit>());
@@ -327,6 +361,7 @@
       selectionMap = new Map();
       undoStack = [];
       refreshApplied();
+      invalidateBranchCache(); // M12c — source/target commit lists may have changed
       // If user originally picked "Apply & Push" or "Apply & Push & Create PR",
       // finish that intent now. nApplied isn't precisely known here (the resolved
       // commit just landed), so we pass 1 for messaging — accurate count survives
@@ -759,12 +794,22 @@
     refreshTargetPRs();
   });
 
+  // M12b — periodic background fetch + "N new commits" badge. Re-armed
+  // whenever the repo, toggle, or interval changes; cleanup clears the timer.
+  $effect(() => {
+    if (!repoPath || !settings.backgroundFetchEnabled) return;
+    const ms = Math.max(60, settings.backgroundFetchIntervalSecs) * 1000;
+    const id = setInterval(backgroundFetchTick, ms);
+    return () => clearInterval(id);
+  });
+
   // ── open repo ─────────────────────────────────────────────
   async function openRepo(path: string) {
     applyResult = null;
     applyError = "";
     selectionMap = new Map();
     loadingCommits = true;
+    branchCommitCache.clear(); // M12c — new repo, old branches' caches are stale
     try {
       // Fetch everything into local vars first — no visible state changes between
       // awaits — so the UI sees only ONE atomic transition at the end.
@@ -794,6 +839,7 @@
       sourceBranch = newSource;
       targetBranch = newTarget;
       commits = newCommits;
+      hasMoreCommits = newCommits.length === settings.maxCommits;
       appliedShas = new Set(appliedList);
       forgeConnection = settings.forgeConnections?.[r.path] ?? null;
       loadingCommits = false;
@@ -815,9 +861,12 @@
           ]);
           branches = refreshedBranches;
           commits = refreshedCommits;
+          hasMoreCommits = refreshedCommits.length === settings.maxCommits;
           appliedShas = new Set(refreshedApplied);
         } catch { /* ignore */ }
       }
+      // M12c — seed the cache for the initially-loaded branch (post-refresh state).
+      cacheBranchCommits(newSource, commits, hasMoreCommits, appliedShas);
       if (r.cherryPickHead) {
         conflictSha = r.cherryPickHead;
         await loadConflictFiles();
@@ -837,12 +886,93 @@
     loadingCommits = true;
     commits = [];
     try {
-      commits = await rpc.git.commits(repoPath, branch, settings.maxCommits, 0, filter ?? activeFilter);
+      const effectiveFilter = filter ?? activeFilter;
+      const newCommits = await rpc.git.commits(repoPath, branch, settings.maxCommits, 0, effectiveFilter);
+      commits = newCommits;
+      hasMoreCommits = newCommits.length === settings.maxCommits;
+      // M12c — write-through the per-branch cache (default unfiltered view only;
+      // covers doFetch/doPull, which call loadCommits(sourceBranch) with no filter).
+      if (Object.keys(effectiveFilter).length === 0) {
+        cacheBranchCommits(branch, newCommits, hasMoreCommits, appliedShas);
+      }
     } catch (e) {
       applyError = e instanceof RpcCallError ? e.rpcError.message : String(e);
     } finally {
       loadingCommits = false;
     }
+  }
+
+  /** M12a — load the next page of commits when the user scrolls near the bottom
+   * of CommitList. `appliedShas` (M10 `git cherry` detection) is intentionally
+   * NOT recomputed here — it stays scoped to the first page (see plan). */
+  async function loadMoreCommits() {
+    if (!repoPath || loadingMoreCommits || !hasMoreCommits) return;
+    loadingMoreCommits = true;
+    try {
+      const page = await rpc.git.commits(repoPath, sourceBranch, settings.maxCommits, commits.length, activeFilter);
+      commits = [...commits, ...page];
+      hasMoreCommits = page.length === settings.maxCommits;
+      // M12c — keep the cache in sync so a later cache-restore includes this page.
+      if (Object.keys(activeFilter).length === 0) {
+        cacheBranchCommits(sourceBranch, commits, hasMoreCommits, appliedShas);
+      }
+    } catch (e) {
+      showToast("error", e instanceof RpcCallError ? e.rpcError.message : String(e));
+    } finally {
+      loadingMoreCommits = false;
+    }
+  }
+
+  /** M12b — periodic background-fetch tick. Silently `git fetch`, then compare
+   * the source branch's upstream against the currently-loaded HEAD to detect
+   * new commits. Skips entirely while any other operation is in flight, or
+   * while a commit filter is active (avoids false positives vs. the filtered
+   * view). Best-effort: all errors are swallowed — this must never surface a
+   * toast or interrupt the user. */
+  async function backgroundFetchTick() {
+    if (
+      !repoPath || busy || conflictBusy || conflictSha !== "" || partialPicking ||
+      loadingCommits || loadingMoreCommits || refreshing ||
+      Object.keys(activeFilter).length > 0
+    ) {
+      return;
+    }
+    try {
+      await rpc.git.fetch(repoPath);
+      const newBranches = await rpc.git.branches(repoPath, true);
+      const srcEntry = newBranches.find((b) => b.name === sourceBranch);
+      const upstreamEntry = srcEntry
+        ? (srcEntry.remote ? srcEntry : newBranches.find((b) => b.remote && b.name === srcEntry.upstream))
+        : undefined;
+      if (upstreamEntry && commits[0] && upstreamEntry.sha !== commits[0].sha) {
+        try {
+          const cmp = await rpc.git.compareBranches(repoPath, commits[0].sha, upstreamEntry.sha);
+          if (cmp.ahead > 0) {
+            newCommitsCount = cmp.ahead;
+            newCommitsUpstream = upstreamEntry.name;
+          }
+        } catch {
+          // Unrelated history or other error — ignore silently.
+        }
+      }
+      branches = newBranches;
+    } catch {
+      // Best-effort background refresh — network errors etc. are ignored.
+    }
+  }
+
+  /** M12b — "N new commits" badge click: bring the new upstream commits into
+   * the source branch's commit list, then clear the badge. */
+  async function loadNewCommits() {
+    branchCommitCache.delete(sourceBranch); // M12c — don't restore a stale page
+    const srcEntry = branches.find((b) => b.name === sourceBranch);
+    if (srcEntry?.remote) {
+      await changeSourceBranch(sourceBranch);
+    } else {
+      await doPull();
+    }
+    newCommitsCount = 0;
+    newCommitsUpstream = "";
   }
 
   async function changeSourceBranch(branch: string) {
@@ -855,6 +985,21 @@
     commitFiles = [];
     dryRunMap = new Map();
     activeFilter = {};
+    // M12b — the "N new commits" badge is scoped to the previous source
+    // branch's upstream; clear it when switching branches.
+    newCommitsCount = 0;
+    newCommitsUpstream = "";
+
+    // M12c — restore from the per-branch session cache, if present. Atomic,
+    // synchronous, no RPC — avoids re-fetching a branch already viewed.
+    const cached = branchCommitCache.get(branch);
+    if (cached) {
+      commits = cached.commits;
+      hasMoreCommits = cached.hasMore;
+      appliedShas = new Set(cached.appliedShas);
+      return;
+    }
+
     // Keep old commits visible while loading; only set the loading flag so a
     // small indicator can show. Atomic swap below avoids the bright→dim flash.
     loadingCommits = true;
@@ -867,7 +1012,10 @@
           : Promise.resolve([] as string[]),
       ]);
       commits = newCommits;
+      hasMoreCommits = newCommits.length === settings.maxCommits;
       appliedShas = new Set(appliedList);
+      // M12c — write-through the freshly-fetched page into the cache.
+      cacheBranchCommits(branch, newCommits, hasMoreCommits, appliedShas);
     } catch (e) {
       applyError = e instanceof RpcCallError ? e.rpcError.message : String(e);
     } finally {
@@ -984,6 +1132,7 @@
 
       // await refreshApplied first, then add skipped on top so they persist
       await refreshApplied();
+      invalidateBranchCache(); // M12c — source/target commit lists may have changed
       const skippedShas: string[] = pickResult.skipped ?? [];
       if (skippedShas.length) {
         appliedShas = new Set([...appliedShas, ...skippedShas]);
@@ -1098,6 +1247,7 @@
           const updated = branches.find((b) => b.isHead);
           if (updated) currentBranch = updated.name;
           await refreshApplied();
+          invalidateBranchCache(); // M12c — squash rewrote the target's commit list
         }
       } catch (e) {
         showToast("error", "Squash failed", e instanceof RpcCallError ? e.rpcError.message : String(e));
@@ -1122,6 +1272,7 @@
       const updated = branches.find((b) => b.isHead);
       if (updated) currentBranch = updated.name;
       await refreshApplied();
+      invalidateBranchCache(); // M12c — target's commit list changed
     } catch (e) {
       if (e instanceof RpcCallError) showToast("error", `[${e.rpcError.code}] ${e.rpcError.message}`);
       else showToast("error", String(e));
@@ -1386,12 +1537,17 @@
           loading={loadingCommits}
           {refreshing}
           applied={appliedShas}
+          hasMore={hasMoreCommits}
+          loadingMore={loadingMoreCommits}
+          {newCommitsCount}
           onsourcebranch={changeSourceBranch}
           ontoggle={toggleCommit}
           onselect={selectCommit}
           onfetch={doFetch}
           onpull={doPull}
           onfilter={applyCommitFilter}
+          onloadmore={loadMoreCommits}
+          onloadnew={loadNewCommits}
         />
       </div>
       <div class="col-resize-handle" onmousedown={startColResize} role="separator" aria-label="Resize panels"></div>

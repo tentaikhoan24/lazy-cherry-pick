@@ -141,6 +141,20 @@ func registerHandlers(s *rpc.Server) {
 		return r.DefaultBranch(ctx, p.DefaultBranchArgs)
 	}))
 
+	// M12b — desktop background-fetch "N new commits" badge. CompareBranches
+	// already existed for the MCP `compare_branches` tool; this registers the
+	// same method for the desktop sidecar.
+	s.Register("git.compareBranches", wrap1(func(ctx context.Context, p struct {
+		Repo string `json:"repo"`
+		git.CompareArgs
+	}) (any, error) {
+		r, err := git.Open(ctx, p.Repo)
+		if err != nil {
+			return nil, err
+		}
+		return r.CompareBranches(ctx, p.CompareArgs)
+	}))
+
 	// git.cherryPick uses a manual handler (not wrap1) so it can inject the
 	// progress callback that streams per-commit notifications to the frontend.
 	s.Register("git.cherryPick", func(ctx context.Context, raw json.RawMessage) (any, *rpc.Error) {

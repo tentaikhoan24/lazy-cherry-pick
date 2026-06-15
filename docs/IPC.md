@@ -177,6 +177,24 @@ Used by the frontend as the default PR base in `CreatePR.svelte`. Loaded atomica
 
 ---
 
+### `git.compareBranches`
+
+Params: `{ repo: string; base: string; head: string; limit?: number }` (`limit` default 100)
+
+Result:
+```ts
+{
+  base: string;
+  head: string;
+  ahead: number;       // number of commits in head..base (head ahead of base)
+  commits: Commit[];   // capped at `limit`
+}
+```
+
+Runs `git log base..head` — the commits `head` has that `base` doesn't (what a PR from `head` into `base` would carry). Already used by the MCP `compare_branches` tool; **M12b** registers the same method for the desktop sidecar so the frontend can detect "N new commits" on the source branch's upstream (background-fetch badge in `CommitList`).
+
+---
+
 ### `git.commits`
 
 Params:
@@ -314,6 +332,8 @@ Params: `{ repo: string; branch: string; remote?: string }` (remote defaults to 
 Result: `{ remote: string; branch: string }`
 
 Runs `git fetch <remote> <branch>:<branch>`. Fast-forward updates the local branch from remote **without checkout**. Fails (non-zero exit) if the update is not a fast-forward — this is intentional safe behavior.
+
+If `branch` is the currently checked-out branch, the `<branch>:<branch>` refspec form is refused by git ("refusing to fetch into branch ... checked out") because it would move the branch ref without touching the index/working tree. In that case `Pull` instead runs `git fetch <remote> <branch>` followed by `git merge --ff-only FETCH_HEAD`, so the checkout itself fast-forwards.
 
 ## Adding a new method — checklist
 

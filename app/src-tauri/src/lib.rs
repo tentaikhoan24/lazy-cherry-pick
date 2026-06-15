@@ -372,6 +372,14 @@ struct AppSettings {
     /// (kind + baseURL + username + host) so we can locate the token.
     #[serde(rename = "forgeConnections", default)]
     forge_connections: HashMap<String, ForgeConnection>,
+    /// M12b — periodically `git.fetch` + compare upstream to show a
+    /// "N new commits" badge on the source branch. Off by default (spawns the
+    /// sidecar periodically).
+    #[serde(rename = "backgroundFetchEnabled", default)]
+    background_fetch_enabled: bool,
+    /// M12b — interval between background fetches, in seconds.
+    #[serde(rename = "backgroundFetchIntervalSecs", default = "default_bg_fetch_interval")]
+    background_fetch_interval_secs: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -392,6 +400,7 @@ fn default_ai_provider() -> String { "claude".to_string() }
 fn default_prompt_via() -> String { "stdin".to_string() }
 fn default_output_format() -> String { "claude-json".to_string() }
 fn default_ai_timeout() -> u32 { 120 }
+fn default_bg_fetch_interval() -> u32 { 300 }
 fn default_ai_args() -> String {
     "-p --output-format json --allowedTools \"Read,Edit,Write,Glob,Grep\" --disallowedTools \"Bash\" --permission-mode acceptEdits --model {model}".to_string()
 }
@@ -421,6 +430,8 @@ impl Default for AppSettings {
             ai_output_format: default_output_format(),
             ai_timeout_secs: default_ai_timeout(),
             forge_connections: HashMap::new(),
+            background_fetch_enabled: false,
+            background_fetch_interval_secs: default_bg_fetch_interval(),
         }
     }
 }

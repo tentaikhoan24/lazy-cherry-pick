@@ -8,6 +8,7 @@ import type {
   Branch,
   Remote,
   Commit,
+  CompareResult,
   CommitFilter,
   CherryPickResult,
   CherryPickProgress,
@@ -80,6 +81,10 @@ export const rpc = {
 
     commits: (repo: string, ref = "HEAD", limit = 100, skip = 0, filter?: CommitFilter) =>
       call<Commit[]>("git.commits", { repo, ref, limit, skip, filter }),
+
+    // M12b — commits in `head` but not in `base`, for the "N new commits" badge.
+    compareBranches: (repo: string, base: string, head: string, limit?: number) =>
+      call<CompareResult>("git.compareBranches", { repo, base, head, limit }),
 
     cherryPick: async (
       repo: string,

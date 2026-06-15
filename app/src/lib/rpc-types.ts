@@ -102,6 +102,14 @@ export interface Commit {
   refs: string[];
 }
 
+// ── M12b — background-fetch "N new commits" badge ──────────
+export interface CompareResult {
+  base: string;
+  head: string;
+  ahead: number; // commits in head..base (head ahead of base)
+  commits: Commit[];
+}
+
 export interface ConflictInfo {
   sha: string;
   files: string[];
@@ -236,6 +244,10 @@ export interface AppSettings {
   aiTimeoutSecs: number;
   /** Per-repo forge connection metadata. Tokens are NOT here — they live in the OS keychain. */
   forgeConnections?: Record<string, ForgeConnection>;
+  /** M12b — periodically `git.fetch` + compare upstream to show a "N new commits" badge. */
+  backgroundFetchEnabled: boolean;
+  /** M12b — interval between background fetches, in seconds (default 300). */
+  backgroundFetchIntervalSecs: number;
 }
 
 /** Result of `detect_ai_tool` Tauri command. */

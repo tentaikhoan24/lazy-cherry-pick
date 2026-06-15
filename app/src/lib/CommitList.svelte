@@ -11,15 +11,34 @@
     loading: boolean;
     refreshing: boolean;
     applied: Set<string>;
+    /** M12a — true if another page of commits may be loaded via `onloadmore`. */
+    hasMore: boolean;
+    /** M12a — a "load more" request is currently in flight. */
+    loadingMore: boolean;
+    /** M12b — number of new commits available on the upstream of `sourceBranch`. 0 = no badge. */
+    newCommitsCount: number;
     onsourcebranch: (branch: string) => void;
     ontoggle: (sha: string) => void;
     onselect: (commit: Commit) => void;
     onfetch: () => void;
     onpull: () => void;
     onfilter: (filter: CommitFilter) => void;
+    /** M12a — fetch and append the next page of commits. */
+    onloadmore: () => void;
+    /** M12b — pull/reload to bring in the new upstream commits. */
+    onloadnew: () => void;
   }
 
-  let { branches, sourceBranch, commits, selected, selectedSha, loading, refreshing, applied, onsourcebranch, ontoggle, onselect, onfetch, onpull, onfilter }: Props = $props();
+  let { branches, sourceBranch, commits, selected, selectedSha, loading, refreshing, applied, hasMore, loadingMore, newCommitsCount, onsourcebranch, ontoggle, onselect, onfetch, onpull, onfilter, onloadmore, onloadnew }: Props = $props();
+
+  // ── M12a — infinite scroll ─────────────────────────────────
+  function onCommitListScroll(e: Event) {
+    const el = e.currentTarget as HTMLElement;
+    if (!hasMore || loadingMore || loading) return;
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 300) {
+      onloadmore();
+    }
+  }
 
   let refreshDropdownOpen = $state(false);
   let refreshMode = $state<"fetch" | "pull">("fetch");
@@ -206,6 +225,12 @@
       onchange={onsourcebranch}
     />
 
+    {#if newCommitsCount > 0}
+      <button class="new-commits-badge" onclick={onloadnew} title="Fetch and load new commits">
+        ↻ {newCommitsCount} new commit{newCommitsCount > 1 ? "s" : ""}
+      </button>
+    {/if}
+
     <!-- Filter toggle -->
     <button
       class="filter-btn"
@@ -347,7 +372,7 @@
     </div>
   {/if}
 
-  <div class="commit-list" class:is-loading={loading}>
+  <div class="commit-list" class:is-loading={loading} onscroll={onCommitListScroll}>
     {#if loading && commits.length === 0}
       <div class="empty">Loading commits…</div>
     {:else if commits.length === 0}
@@ -399,6 +424,9 @@
           {/if}
         </div>
       {/each}
+      {#if loadingMore}
+        <div class="loading-more">Loading more…</div>
+      {/if}
     {/if}
   </div>
 </div>
@@ -515,6 +543,21 @@
     padding: 0 0.35rem;
     line-height: 1.4;
   }
+
+  /* M12b — "N new commits" badge */
+  .new-commits-badge {
+    flex-shrink: 0;
+    background: var(--accent, #4a7ef5);
+    color: #fff;
+    font-size: 0.75rem;
+    font-weight: 600;
+    border: none;
+    border-radius: 99px;
+    padding: 0.25rem 0.6rem;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .new-commits-badge:hover { filter: brightness(1.1); }
 
   /* filter bar */
   .filter-bar {
@@ -742,6 +785,12 @@
     padding: 1.5rem;
     text-align: center;
     font-size: 0.85rem;
+    color: var(--text-muted, #666);
+  }
+  .loading-more {
+    padding: 0.6rem;
+    text-align: center;
+    font-size: 0.78rem;
     color: var(--text-muted, #666);
   }
   .commit-row {

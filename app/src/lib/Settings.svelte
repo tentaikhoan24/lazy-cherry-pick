@@ -93,6 +93,9 @@
   let showEolMarkers = $state(settings.showEolMarkers);
   let autoFetchOnOpen = $state(settings.autoFetchOnOpen);
   let autoStash = $state(settings.autoStash);
+  // M12b — background fetch + "N new commits" badge
+  let backgroundFetchEnabled = $state(settings.backgroundFetchEnabled);
+  let backgroundFetchIntervalSecs = $state(settings.backgroundFetchIntervalSecs);
   let checkForUpdatesOnStartup = $state(settings.checkForUpdatesOnStartup);
   let theme = $state(settings.theme);
   let checkingNow = $state(false);
@@ -166,6 +169,7 @@
   function save() {
     onsave({
       maxCommits, defaultApplyMode, showEolMarkers, autoFetchOnOpen, autoStash, theme,
+      backgroundFetchEnabled, backgroundFetchIntervalSecs,
       externalDiffEnabled, externalDiffPath, externalDiffArgs,
       externalMergeEnabled, externalMergePath, externalMergeArgs,
       checkForUpdatesOnStartup,
@@ -280,7 +284,10 @@
           <h3 class="tab-heading">General</h3>
 
           <div class="setting-row">
-            <label class="setting-label" for="max-commits">Max commits to load</label>
+            <label class="setting-label" for="max-commits">
+              Commits per page
+              <span class="setting-hint">Scroll to the bottom of the commit list to load more</span>
+            </label>
             <input
               id="max-commits"
               type="number"
@@ -341,6 +348,39 @@
               {autoStash ? "On" : "Off"}
             </button>
           </div>
+
+          <div class="setting-row">
+            <span class="setting-label">
+              Background fetch
+              <span class="setting-hint">Periodically fetch and show a "N new commits" badge on the source branch</span>
+            </span>
+            <button
+              class="toggle"
+              class:on={backgroundFetchEnabled}
+              onclick={() => (backgroundFetchEnabled = !backgroundFetchEnabled)}
+              aria-checked={backgroundFetchEnabled}
+              role="switch"
+            >
+              {backgroundFetchEnabled ? "On" : "Off"}
+            </button>
+          </div>
+
+          {#if backgroundFetchEnabled}
+            <div class="setting-row">
+              <label class="setting-label" for="bg-fetch-interval">
+                Background fetch interval (seconds)
+                <span class="setting-hint">Minimum 60 seconds</span>
+              </label>
+              <input
+                id="bg-fetch-interval"
+                type="number"
+                class="setting-input"
+                bind:value={backgroundFetchIntervalSecs}
+                min={60}
+                step={30}
+              />
+            </div>
+          {/if}
 
           <div class="setting-row">
             <span class="setting-label">Theme</span>

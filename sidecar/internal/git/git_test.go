@@ -55,6 +55,17 @@ func initRepo(t *testing.T) *Repo {
 	return repo
 }
 
+// gitSh runs `git <args...>` in dir, failing the test on error.
+func gitSh(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_AUTHOR_DATE=2026-01-02T00:00:00Z", "GIT_COMMITTER_DATE=2026-01-02T00:00:00Z")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
 func TestOpen_NotARepo(t *testing.T) {
 	dir := t.TempDir()
 	_, err := Open(context.Background(), dir)
@@ -259,5 +270,92 @@ func TestCherryPick_Conflict(t *testing.T) {
 	st2, _ := repo.Status(ctx)
 	if st2.Dirty {
 		t.Errorf("repo should be clean after abort, got: %+v", st2)
+	}
+}
+
+// TestPull_CheckedOutBranch covers the M12b bug: "git fetch origin main:main"
+// is refused by git when main is the checked-out branch. Pull must fall back
+// to fetch + `merge --ff-only` so the working tree picks up the new commit.
+func TestPull_CheckedOutBranch(t *testing.T) {
+	repo := initRepo(t)
+	ctx := context.Background()
+
+	// A second repo, cloned from repo, acts as "origin" with a new commit on main.
+	remoteDir := t.TempDir()
+	if out, err := exec.Command("git", "clone", "-q", repo.Path, remoteDir).CombinedOutput(); err != nil {
+		t.Fatalf("clone: %v\n%s", err, out)
+	}
+	gitSh(t, remoteDir, "config", "user.email", "test@example.com")
+	gitSh(t, remoteDir, "config", "user.name", "Test")
+	gitSh(t, remoteDir, "config", "commit.gpgsign", "false")
+	gitSh(t, remoteDir, "checkout", "-q", "main")
+	if err := os.WriteFile(filepath.Join(remoteDir, "remote.txt"), []byte("from remote\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitSh(t, remoteDir, "add", "remote.txt")
+	gitSh(t, remoteDir, "commit", "-q", "-m", "feat: remote update")
+
+	gitSh(t, repo.Path, "remote", "add", "origin", remoteDir)
+	if _, err := run(ctx, repo.Path, "fetch", "origin"); err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+
+	// main is checked out in repo — must take the fetch+merge --ff-only path.
+	res, err := repo.Pull(ctx, PullArgs{Branch: "main", Remote: "origin"})
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	if res.Branch != "main" || res.Remote != "origin" {
+		t.Errorf("unexpected result: %+v", res)
+	}
+
+	if _, err := os.Stat(filepath.Join(repo.Path, "remote.txt")); err != nil {
+		t.Errorf("expected remote.txt in working tree after pull: %v", err)
+	}
+	st, _ := repo.Status(ctx)
+	if st.Dirty {
+		t.Errorf("expected clean tree after ff-only merge, got: %+v", st)
+	}
+}
+
+// TestPull_NonCheckedOutBranch covers the original M4 use case: fast-forwarding
+// a local branch that is NOT checked out, via "git fetch origin branch:branch".
+func TestPull_NonCheckedOutBranch(t *testing.T) {
+	repo := initRepo(t) // HEAD = main; feature/x exists but is not checked out
+
+	remoteDir := t.TempDir()
+	if out, err := exec.Command("git", "clone", "-q", repo.Path, remoteDir).CombinedOutput(); err != nil {
+		t.Fatalf("clone: %v\n%s", err, out)
+	}
+	gitSh(t, remoteDir, "config", "user.email", "test@example.com")
+	gitSh(t, remoteDir, "config", "user.name", "Test")
+	gitSh(t, remoteDir, "config", "commit.gpgsign", "false")
+	gitSh(t, remoteDir, "checkout", "-q", "feature/x")
+	if err := os.WriteFile(filepath.Join(remoteDir, "feature2.txt"), []byte("more feature\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	gitSh(t, remoteDir, "add", "feature2.txt")
+	gitSh(t, remoteDir, "commit", "-q", "-m", "feat: more feature")
+
+	ctx := context.Background()
+	gitSh(t, repo.Path, "remote", "add", "origin", remoteDir)
+	if _, err := run(ctx, repo.Path, "fetch", "origin"); err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+
+	res, err := repo.Pull(ctx, PullArgs{Branch: "feature/x", Remote: "origin"})
+	if err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	if res.Branch != "feature/x" {
+		t.Errorf("unexpected result: %+v", res)
+	}
+
+	cs, err := repo.Commits(ctx, CommitsArgs{Ref: "feature/x", Limit: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cs[0].Subject != "feat: more feature" {
+		t.Errorf("feature/x HEAD = %q, want updated commit", cs[0].Subject)
 	}
 }
